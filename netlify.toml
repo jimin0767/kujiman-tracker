@@ -1,0 +1,15 @@
+# netlify.toml
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[[redirects]]
+  from = "/kujiman-api/*"
+  to = "https://api.kujiman.com/api_mini_apps/reward/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
