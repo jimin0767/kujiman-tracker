@@ -22,6 +22,15 @@ const mean = a => a.length ? a.reduce((s,v) => s+v, 0) / a.length : 0;
 const median = a => { if (!a.length) return 0; const s=[...a].sort((x,y)=>x-y), m=Math.floor(s.length/2); return s.length%2?s[m]:(s[m-1]+s[m])/2; };
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
+function getHistoryGapBand(gap, expectedGap) {
+  if (!Number.isFinite(gap) || !Number.isFinite(expectedGap) || expectedGap <= 0) return "neutral";
+  if (gap === expectedGap) return "exact";
+  if (gap < expectedGap * 0.75) return "low";
+  if (gap < expectedGap) return "nearLow";
+  if (gap <= expectedGap * 1.25) return "nearHigh";
+  return "high";
+}
+
 function classifyGapState(gap, expectedGap) {
   if (!Number.isFinite(gap) || !Number.isFinite(expectedGap) || expectedGap <= 0) return "neutral";
   if (gap >= expectedGap * 1.15) return "long";
@@ -182,7 +191,7 @@ const C = {
   bg:"#08090c",surface:"#101218",surfaceAlt:"#181c25",border:"#252a36",
   text:"#dfe2ea",dim:"#7c8294",muted:"#4e5467",
   gold:"#e8b931",goldGlow:"rgba(232,185,49,0.12)",
-  blue:"#4d8fec",green:"#3dca78",red:"#ec5454",purple:"#9b7aed",cyan:"#2ec4d4",orange:"#ed8a36",pink:"#e36fa0",
+  blue:"#4d8fec",green:"#3dca78",red:"#ec5454",purple:"#9b7aed",cyan:"#2ec4d4",orange:"#ed8a36",yellow:"#f2d14c",gray:"#9aa0af",pink:"#e36fa0",
 };
 const ITEM_COLORS = ["#4d8fec","#3dca78","#ec5454","#9b7aed","#2ec4d4","#ed8a36","#e36fa0","#e8b931","#6ee7b7","#f9a8d4","#93c5fd","#fbbf24","#a5b4fc","#34d399","#fb923c","#f87171","#c084fc","#22d3ee","#a3e635","#fda4af"];
 const font = "'DM Sans',sans-serif";
@@ -1264,19 +1273,35 @@ const loadData = useCallback(async () => {
                   <span style={{minWidth:"90px",textAlign:"right"}}>Time</span>
                   <span style={{minWidth:"55px",textAlign:"right"}}>Gap</span>
                 </div>
-                {[...e.recs].reverse().map((r,i)=>(
-                  <div key={r.id} style={{display:"flex",alignItems:"center",padding:"6px 10px",borderRadius:"4px",background:i===0?C.goldGlow:"transparent",fontSize:"12px"}}>
-                    <span style={{fontFamily:mono,fontWeight:600,color:i===0?C.gold:C.text,minWidth:"70px"}}>#{r.num_sort.toLocaleString()}</span>
-                    <span style={{color:C.dim,flex:1}}>{r.nickname}</span>
-                    <span style={{color:C.dim,flex:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",fontSize:"11px"}}>{r.reward_item_name?.replace(/^[^｜]*｜/,"")?.slice(0,45)}</span>
-                    <span style={{color:C.muted,fontSize:"10px",minWidth:"90px",textAlign:"right"}}>{r.create_time?.slice(5,16)}</span>
-                    {i<e.gaps.length && (
-                      <span style={{fontFamily:mono,fontSize:"10px",color:e.gaps[e.gaps.length-1-i]>e.statedGap?C.red:C.green,minWidth:"55px",textAlign:"right"}}>
-                        Δ{e.gaps[e.gaps.length-1-i]?.toLocaleString()}
-                      </span>
-                    )}
-                  </div>
-                ))}
+                {[...e.recs].reverse().map((r,i)=>{
+                  const gapValue = i < e.gaps.length ? e.gaps[e.gaps.length - 1 - i] : null;
+                  const gapBand = getHistoryGapBand(gapValue, e.statedGap);
+                  const gapColor = gapBand === "low"
+                    ? C.green
+                    : gapBand === "nearLow"
+                      ? C.yellow
+                      : gapBand === "exact"
+                        ? C.gray
+                        : gapBand === "nearHigh"
+                          ? C.orange
+                          : gapBand === "high"
+                            ? C.red
+                            : C.dim;
+
+                  return (
+                    <div key={r.id} style={{display:"flex",alignItems:"center",padding:"6px 10px",borderRadius:"4px",background:i===0?C.goldGlow:"transparent",fontSize:"12px"}}>
+                      <span style={{fontFamily:mono,fontWeight:600,color:i===0?C.gold:C.text,minWidth:"70px"}}>#{r.num_sort.toLocaleString()}</span>
+                      <span style={{color:C.dim,flex:1}}>{r.nickname}</span>
+                      <span style={{color:C.dim,flex:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",fontSize:"11px"}}>{r.reward_item_name?.replace(/^[^｜]*｜/,"")?.slice(0,45)}</span>
+                      <span style={{color:C.muted,fontSize:"10px",minWidth:"90px",textAlign:"right"}}>{r.create_time?.slice(5,16)}</span>
+                      {gapValue !== null && (
+                        <span style={{fontFamily:mono,fontSize:"10px",color:gapColor,minWidth:"55px",textAlign:"right"}}>
+                          Δ{gapValue.toLocaleString()}
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}
