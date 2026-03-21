@@ -1,7 +1,9 @@
-# netlify.toml
 [build]
   command = "npm run build"
   publish = "dist"
+
+[build.environment]
+  SECRETS_SCAN_OMIT_KEYS = "VITE_SUPABASE_URL,VITE_SUPABASE_ANON_KEY,VITE_KUJIMAN_API_BASE"
 
 [[redirects]]
   from = "/kujiman-api/*"
