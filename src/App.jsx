@@ -25,10 +25,59 @@ const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 function getHistoryGapBand(gap, expectedGap) {
   if (!Number.isFinite(gap) || !Number.isFinite(expectedGap) || expectedGap <= 0) return "neutral";
   if (gap === expectedGap) return "exact";
-  if (gap < expectedGap * 0.75) return "low";
+  if (gap < expectedGap * 0.8) return "low";
   if (gap < expectedGap) return "nearLow";
-  if (gap <= expectedGap * 1.25) return "nearHigh";
+  if (gap <= expectedGap * 1.2) return "nearHigh";
   return "high";
+}
+
+function getHistoryGapColor(gap, expectedGap) {
+  const band = getHistoryGapBand(gap, expectedGap);
+  if (band === "low") return C.green;
+  if (band === "nearLow") return C.yellow;
+  if (band === "exact") return C.gray;
+  if (band === "nearHigh") return C.orange;
+  if (band === "high") return C.red;
+  return C.dim;
+}
+
+function hexToRgb(hex) {
+  const normalized = hex.replace("#", "");
+  const full = normalized.length === 3 ? normalized.split("").map(ch => ch + ch).join("") : normalized;
+  const value = parseInt(full, 16);
+  return {
+    r: (value >> 16) & 255,
+    g: (value >> 8) & 255,
+    b: value & 255,
+  };
+}
+
+function mixHex(a, b, t) {
+  const ca = hexToRgb(a);
+  const cb = hexToRgb(b);
+  const blend = key => Math.round(ca[key] + (cb[key] - ca[key]) * clamp(t, 0, 1));
+  return `rgb(${blend("r")}, ${blend("g")}, ${blend("b")})`;
+}
+
+function getGapGradientColor(gap, expectedGap) {
+  if (!Number.isFinite(gap) || !Number.isFinite(expectedGap) || expectedGap <= 0) return C.dim;
+  const ratio = clamp(gap / expectedGap, 0, 2);
+  const anchors = [
+    { ratio: 0, color: C.green },
+    { ratio: 0.8, color: C.yellow },
+    { ratio: 1.0, color: C.gray },
+    { ratio: 1.2, color: C.orange },
+    { ratio: 2.0, color: C.red },
+  ];
+  for (let i = 0; i < anchors.length - 1; i++) {
+    const left = anchors[i];
+    const right = anchors[i + 1];
+    if (ratio >= left.ratio && ratio <= right.ratio) {
+      const span = right.ratio - left.ratio || 1;
+      return mixHex(left.color, right.color, (ratio - left.ratio) / span);
+    }
+  }
+  return anchors[anchors.length - 1].color;
 }
 
 function classifyGapState(gap, expectedGap) {
@@ -173,6 +222,24 @@ async function sbInsert(table, payload, prefer = "") {
   return res;
 }
 
+
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function runWorker() {
+    while (true) {
+      const currentIndex = nextIndex++;
+      if (currentIndex >= items.length) break;
+      results[currentIndex] = await worker(items[currentIndex], currentIndex);
+    }
+  }
+
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  return results;
+}
+
 /* ═══ FONTS + PALETTE ═══ */
 const fl = document.createElement("link");
 fl.href = "https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap";
@@ -268,56 +335,49 @@ const loadData = useCallback(async () => {
   const liveFetch = useCallback(async () => {
     setLiveLoading(true);
     setLiveStatus("Fetching event list...");
+    setLiveUpdatedPools([]);
     try {
       const API = KUJIMAN_API_BASE;
       const ts = () => Math.floor(Date.now() / 1000);
       const EXCLUDE_POOLS = new Set([922, 974, 735]);
+      const LIVE_CONCURRENCY = 20;
 
       const evtRes = await fetch(`${API}/reward_pool_infinite?order_type=3&infinite_type_id=0&sort=0&time=${ts()}&os=4&client_env=h5`);
       const evtJson = await evtRes.json();
       const activeEvts = (evtJson.data?.reward_pool_infinite || []).filter(e => e.status === 1 && !EXCLUDE_POOLS.has(e.id));
 
-      const newSnaps = { ...snapshots };
-      let done = 0, totalNewRecs = 0;
-      const updatedPoolNames = [];
+      let done = 0;
+      const existingIds = new Set(records.map(r => r.id));
 
-      for (const ev of activeEvts) {
+      const results = await mapWithConcurrency(activeEvts, LIVE_CONCURRENCY, async (ev) => {
+        const startedAt = new Date().toISOString();
+
         try {
-          setLiveStatus(`⚡ ${ev.reward_pool_name} (${done + 1}/${activeEvts.length})`);
+          const [mRes, sRes] = await Promise.all([
+            fetch(`${API}/reward_pool_infinite_mowang?reward_pool_id=${ev.id}&append_rank=1&time=${ts()}&os=4&client_env=h5`),
+            fetch(`${API}/reward_pool_infinite_item_speed?reward_pool_id=${ev.id}&reward_cur_box_num=1&append_max_num_sort=1&append_item_init=1&append_record=1&record_level=2&list_first_id=9999999999&list_first_item_type=UR&time=${ts()}&os=4&client_env=h5`),
+          ]);
 
-          // 1. Fetch mowang for max_num_sort
-          const mRes = await fetch(`${API}/reward_pool_infinite_mowang?reward_pool_id=${ev.id}&append_rank=1&time=${ts()}&os=4&client_env=h5`);
-          const mData = (await mRes.json()).data?.cur_mowang;
+          const [mJson, sJson] = await Promise.all([mRes.json(), sRes.json()]);
+          const mData = mJson.data?.cur_mowang;
+          const sData = sJson.data;
 
-          if (mData?.max_num_sort) {
-            newSnaps[ev.id] = { reward_pool_id: ev.id, max_num_sort: mData.max_num_sort, collected_at: new Date().toISOString(), live: true };
-
-            // Write snapshot to Supabase
-            await sbInsert("event_snapshots", {
-              reward_pool_id: ev.id,
-              max_num_sort: mData.max_num_sort,
-              raw_meta: { cur_mowang: mData, source: "live_dashboard" },
-            });
-          }
-
-          await new Promise(r => setTimeout(r, 150));
-
-          // 2. Fetch UR win records
-          const sRes = await fetch(`${API}/reward_pool_infinite_item_speed?reward_pool_id=${ev.id}&reward_cur_box_num=1&append_max_num_sort=1&append_item_init=1&append_record=1&record_level=2&list_first_id=9999999999&list_first_item_type=UR&time=${ts()}&os=4&client_env=h5`);
-          const sData = (await sRes.json()).data;
+          const snapshotRow = mData?.max_num_sort ? {
+            reward_pool_id: ev.id,
+            max_num_sort: mData.max_num_sort,
+            collected_at: startedAt,
+            live: true,
+          } : null;
 
           const listSecond = (sData?.append_record?.list_second || []).filter(r => r.reward_item_type === "UR");
           const listFirst = (sData?.append_record?.list_first || []).filter(r => r.reward_item_type === "UR");
 
-          // Deduplicate
           const seen = new Set();
-          const allRecs = [];
+          const rows = [];
           for (const r of [...listSecond, ...listFirst]) {
-            if (r.id && !seen.has(r.id)) { seen.add(r.id); allRecs.push(r); }
-          }
-
-          if (allRecs.length > 0) {
-            const rows = allRecs.map(r => ({
+            if (!r.id || seen.has(r.id)) continue;
+            seen.add(r.id);
+            rows.push({
               id: r.id,
               reward_pool_id: ev.id,
               num_sort: r.num_sort,
@@ -331,50 +391,73 @@ const loadData = useCallback(async () => {
               reward_item_type: r.reward_item_type || "UR",
               source: "live_dashboard",
               raw_record: r,
-            }));
+            });
+          }
 
-            // Upsert to Supabase (duplicates ignored)
-            const uRes = await sbInsert(
-              "win_records",
-              rows,
-              "resolution=ignore-duplicates,return=minimal"
-            );
+          await Promise.all([
+            snapshotRow ? sbInsert("event_snapshots", {
+              reward_pool_id: ev.id,
+              max_num_sort: mData.max_num_sort,
+              raw_meta: { cur_mowang: mData, source: "live_dashboard" },
+            }) : Promise.resolve(),
+            rows.length ? sbInsert("win_records", rows, "resolution=ignore-duplicates,return=minimal") : Promise.resolve(),
+          ]);
 
-            if (uRes.ok || uRes.status === 201) {
-              // Count truly new ones by checking against current records
-              const existingIds = new Set(records.map(r => r.id));
-              const newOnes = rows.filter(r => !existingIds.has(r.id));
-              totalNewRecs += newOnes.length;
-              if (newOnes.length > 0) updatedPoolNames.push({ name: ev.reward_pool_name, pid: ev.id, count: newOnes.length });
+          const newRows = [];
+          for (const row of rows) {
+            if (!existingIds.has(row.id)) {
+              existingIds.add(row.id);
+              newRows.push(row);
             }
           }
 
-          done++;
-          await new Promise(r => setTimeout(r, 150));
-        } catch { done++; }
+          done += 1;
+          setLiveStatus(`⚡ Live fetch ${done}/${activeEvts.length} complete`);
+
+          return {
+            ok: true,
+            event: ev,
+            snapshotRow,
+            newRows,
+          };
+        } catch (error) {
+          done += 1;
+          setLiveStatus(`⚡ Live fetch ${done}/${activeEvts.length} complete`);
+          return { ok: false, event: ev, error };
+        }
+      });
+
+      const nextSnapshots = { ...snapshots };
+      const incomingRows = [];
+      const updatedPoolNames = [];
+
+      for (const result of results) {
+        if (!result?.ok) continue;
+        if (result.snapshotRow) {
+          nextSnapshots[result.event.id] = result.snapshotRow;
+        }
+        if (result.newRows.length > 0) {
+          incomingRows.push(...result.newRows);
+          updatedPoolNames.push({ name: result.event.reward_pool_name, pid: result.event.id, count: result.newRows.length });
+        }
       }
-      
-      setSnapshots(newSnaps);
+
+      const totalNewRecs = incomingRows.length;
+      setSnapshots(nextSnapshots);
       setLastRefresh(new Date());
 
-      // Reload records from Supabase to pick up new ones
-      if (totalNewRecs > 0) {
-        let allRecs = [], offset = 0;
-        const PAGE = 1000;
-        while (true) {
-          const page = await sbFetch("win_records",
-            `select=id,reward_pool_id,num_sort,create_time,nickname,reward_item_name,reward_item_id,reward_item_type&reward_item_type=eq.UR&order=reward_pool_id,num_sort.asc&limit=${PAGE}&offset=${offset}`);
-          allRecs = allRecs.concat(page || []);
-          if (!page || page.length < PAGE) break;
-          offset += PAGE;
-        }
-        setRecords(allRecs);
+      if (incomingRows.length > 0) {
+        const merged = [...records, ...incomingRows]
+          .sort((a, b) => (a.reward_pool_id - b.reward_pool_id) || (a.num_sort - b.num_sort));
+        setRecords(merged);
       }
 
-      setLiveStatus(`✓ Live complete — ${done} events, ${totalNewRecs} new record${totalNewRecs !== 1 ? "s" : ""} saved`);
+      setLiveStatus(`✓ Live complete — ${activeEvts.length} events, ${totalNewRecs} new record${totalNewRecs !== 1 ? "s" : ""} saved`);
       setLiveUpdatedPools(updatedPoolNames);
       setTimeout(() => setLiveStatus(""), 8000);
-    } catch (e) { setLiveStatus(`Error: ${e.message}`); }
+    } catch (e) {
+      setLiveStatus(`Error: ${e.message}`);
+    }
     setLiveLoading(false);
   }, [snapshots, records]);
 
@@ -504,19 +587,58 @@ const loadData = useCallback(async () => {
         // Take last (N-1) completed gaps + current ongoing gap = N entries
         const completedSlice = w.label === "All" ? gaps : gaps.slice(-(w.n - 1));
         const totalEntries = completedSlice.length + 1; // +1 for currentGap
-        if (totalEntries < w.minReq) return { ...w, pressure: 0, actual: 0, theoretical: 0, count: totalEntries, active: false, targetNum: 0, targetGap: 0, currentGapInc: currentGap };
+        if (totalEntries < w.minReq) {
+          return {
+            ...w,
+            pressure: 0,
+            actual: 0,
+            theoretical: 0,
+            count: totalEntries,
+            active: false,
+            targetNum: 0,
+            targetGap: 0,
+            currentGapInc: currentGap,
+            overExpected: 0,
+            overExpectedPct: 0,
+          };
+        }
         const completedSum = completedSlice.reduce((s, v) => s + v, 0);
         const actual = completedSum + currentGap;
-        const theoretical = Math.round(totalEntries / statedP);
-        const pressure = Math.round(Math.min((actual / theoretical) * 100, 200));
+        const theoretical = totalEntries / statedP;
+        const pressure = theoretical > 0 ? (actual / theoretical) * 100 : 0;
         // Target: draw number where this window hits 100%
-        const neededGap = Math.max(0, theoretical - completedSum);
+        const neededGap = Math.max(0, Math.ceil(theoretical - completedSum));
         const targetNum = lastWin + neededGap;
-        return { ...w, pressure, actual, theoretical, count: totalEntries, active: true, targetNum, targetGap: neededGap, currentGapInc: currentGap };
+        const overExpected = Math.max(0, actual - theoretical);
+        const overExpectedPct = Math.max(0, pressure - 100);
+
+        return {
+          ...w,
+          pressure,
+          actual,
+          theoretical,
+          count: totalEntries,
+          active: true,
+          targetNum,
+          targetGap: neededGap,
+          currentGapInc: currentGap,
+          overExpected,
+          overExpectedPct,
+        };
       });
       const activeWindows = burstWindows.filter(w => w.active);
+      const pressureGaugeMax = Math.max(
+        125,
+        Math.ceil(
+          Math.max(100, ...activeWindows.map(w => w.pressure || 0)) / 25
+        ) * 25
+      );
       const allInDebt = activeWindows.length >= 2 && activeWindows.every(w => w.pressure >= 100);
-      const primaryPressure = (burstWindows.find(w => w.active && w.label === "Medium") || burstWindows.find(w => w.active))?.pressure || 0;
+      const primaryPressure = (
+        burstWindows.find(w => w.active && w.label === "20") ||
+        burstWindows.find(w => w.active && w.label === "10") ||
+        burstWindows.find(w => w.active)
+      )?.pressure || 0;
       const burstPressure = primaryPressure;
       const burstLevel = allInDebt ? "convergence" : burstPressure >= 100 ? "critical" : burstPressure >= 80 ? "high" : burstPressure >= 50 ? "medium" : "low";
       const strategyHint = burstLevel === "convergence" ? "TOTAL CONVERGENCE (Enter Now)" : burstLevel === "critical" ? "TARGET ACQUIRED (Enter Now)" : burstLevel === "high" ? "High Pressure Zone (Prepare)" : "Accumulating Energy (Wait)";
@@ -578,21 +700,33 @@ const loadData = useCallback(async () => {
       const hardPityPct = hardPity > 0 ? (currentGap / hardPity) * 100 : 0;
       const nearHardPity = hardPityPct >= 90 && gaps.length >= 5;
 
-      // Gap histogram (Sweet Spot) — tightened: cap at 2.5x expected gap, 15-20 bins
-      const displayMax = gaps.length ? Math.max(...gaps) : Math.round(statedGap * 3);
-      const targetBins = 18;
-      const bucketSize = Math.max(1, Math.round(displayMax / targetBins));
+      // Gap histogram (Sweet Spot) — fixed 20% bands of expected gap
+      const bucketSize = Math.max(1, Math.round(statedGap * 0.2));
+      const displayMaxRaw = Math.max(currentGap, gaps.length ? Math.max(...gaps) : 0, statedGap * 2.2);
+      const displayMax = Math.max(bucketSize, Math.ceil(displayMaxRaw / bucketSize) * bucketSize);
       const gapBuckets = {};
       const outlierCount = 0;
-      gaps.forEach(g => { const k = Math.floor(g / bucketSize) * bucketSize; gapBuckets[k] = (gapBuckets[k] || 0) + 1; });
+      gaps.forEach(g => {
+        const k = Math.floor(g / bucketSize) * bucketSize;
+        gapBuckets[k] = (gapBuckets[k] || 0) + 1;
+      });
       // Ensure all bins from 0 to displayMax exist (even empty ones for consistent chart)
-      for (let b = 0; b < displayMax; b += bucketSize) { if (!gapBuckets[b]) gapBuckets[b] = 0; }
-      const gapHistogram = Object.entries(gapBuckets).map(([k, v]) => ({
-        range: `${(+k).toLocaleString()}~${(+k + bucketSize).toLocaleString()}`,
-        rangeStart: +k,
-        count: v,
-        pct: gaps.length > 0 ? (v / gaps.length * 100) : 0,
-      })).sort((a, b) => a.rangeStart - b.rangeStart);
+      for (let b = 0; b < displayMax; b += bucketSize) {
+        if (!gapBuckets[b]) gapBuckets[b] = 0;
+      }
+      const gapHistogram = Object.entries(gapBuckets).map(([k, v]) => {
+        const rangeStart = +k;
+        const rangeMid = rangeStart + bucketSize / 2;
+        return {
+          range: `${rangeStart.toLocaleString()}~${(rangeStart + bucketSize).toLocaleString()}`,
+          rangeStart,
+          rangeMid,
+          count: v,
+          pct: gaps.length > 0 ? (v / gaps.length * 100) : 0,
+          fill: getGapGradientColor(rangeMid, statedGap),
+          band: getHistoryGapBand(rangeMid, statedGap),
+        };
+      }).sort((a, b) => a.rangeStart - b.rangeStart);
       const sweetSpot = gapHistogram.length > 0 ? gapHistogram.reduce((best, b) => b.count > best.count ? b : best, gapHistogram[0]) : null;
 
       // Soft Pity Analyzer: Empirical vs Theoretical (uses same tightened bins)
@@ -615,7 +749,7 @@ const loadData = useCallback(async () => {
         itemStats, neverWon, lastWonItem, poolItems,
         hardPity, hardPityPct, nearHardPity, gapHistogram, sweetSpot, bucketSize,
         softPityData, rubberBandData, displayMax, outlierCount,
-        burstPressure, burstLevel, strategyHint, burstWindows, allInDebt,
+        burstPressure, burstLevel, strategyHint, burstWindows, allInDebt, pressureGaugeMax,
         droughtStreak, springLoaded, debtRelease, recoveryBias };
     });
   }, [events, records, snapshots, itemsByPool]);
@@ -694,7 +828,17 @@ const loadData = useCallback(async () => {
   /* ════════════════════════════════════════════ */
   if (sel) {
     const e = sel;
-    const gapTrend = e.gaps.map((g,i) => ({idx:i+1,gap:g,avg:Math.round(mean(e.gaps.slice(0,i+1))),expected:e.statedGap,label:`#${i+1}`}));
+    const gapTrend = e.gaps.map((g, i) => ({
+      idx: i + 1,
+      gap: g,
+      avg: Math.round(mean(e.gaps.slice(0, i + 1))),
+      expected: e.statedGap,
+      lowBand: Math.round(e.statedGap * 0.8),
+      highBand: Math.round(e.statedGap * 1.2),
+      label: `#${i + 1}`,
+      band: getHistoryGapBand(g, e.statedGap),
+      fill: getHistoryGapColor(g, e.statedGap),
+    }));
 
     // Item frequency chart data
     const itemChartData = e.itemStats.filter(i => i.wins > 0).map((it, idx) => ({
@@ -756,7 +900,7 @@ const loadData = useCallback(async () => {
                 {l:"Max Historical",v:(e.gaps.length?Math.max(...e.gaps):0).toLocaleString(),c:C.dim},
                 {l:"Drought Severity",v:`${(e.cumProb*100).toFixed(1)}%`,c:e.cumProb>.9?C.red:e.cumProb>.5?C.orange:C.green,glow:e.cumProb>.9},
                 {l:"Drought Streak",v:e.droughtStreak>0?`${"🔥".repeat(Math.min(e.droughtStreak,5))}${e.droughtStreak>5?"+":""}`:"-",c:e.droughtStreak>=3?C.red:e.droughtStreak>=2?C.orange:C.dim,glow:e.droughtStreak>=2},
-                {l:"Burst Pressure",v:e.burstPressure>0?`${Math.round(e.burstPressure)}%`:"N/A",c:e.burstLevel==="convergence"?C.gold:e.burstLevel==="critical"?C.red:e.burstLevel==="high"?C.orange:C.dim,glow:e.allInDebt},
+                {l:"Burst Pressure",v:e.burstPressure>0?`${e.burstPressure.toFixed(1)}%`:"N/A",c:e.burstLevel==="convergence"?C.gold:e.burstLevel==="critical"?C.red:e.burstLevel==="high"?C.orange:C.dim,glow:e.allInDebt},
                 {l:"Avg Gap",v:Math.round(e.avgGap||0).toLocaleString(),c:C.green},
               ].map((s,i)=>(
                 <div key={i} style={{background:C.surfaceAlt,borderRadius:"8px",padding:"12px",
@@ -818,24 +962,31 @@ const loadData = useCallback(async () => {
                 {/* Multi-Gauge */}
                 <div style={{fontSize:"12px",fontWeight:600,color:e.allInDebt?C.gold:C.dim,textTransform:"uppercase",letterSpacing:"1px",marginBottom:"10px"}}>
                   {e.allInDebt ? "⚡ TOTAL CONVERGENCE — All timeframes in debt" : "Pressure multi-gauge"}
-                  <span style={{fontSize:"10px",color:C.muted,textTransform:"none",fontWeight:400,marginLeft:"8px"}}>(incl. current gap {e.currentGap.toLocaleString()})</span>
+                  <span style={{fontSize:"10px",color:C.muted,textTransform:"none",fontWeight:400,marginLeft:"8px"}}>
+                    (incl. current gap {e.currentGap.toLocaleString()} · scale 0–{Math.round(e.pressureGaugeMax).toLocaleString()}%)
+                  </span>
                 </div>
-                <div style={{display:"grid",gridTemplateColumns:`repeat(${e.burstWindows.filter(w=>w.active||w.label!=="All").length},1fr)`,gap:"10px",marginBottom:"10px"}}>
+                <div style={{display:"grid",gridTemplateColumns:`repeat(${e.burstWindows.filter(w=>w.active||w.label!=="All").length}, minmax(0, 1fr))`,gap:"10px",marginBottom:"10px",alignItems:"stretch"}}>
                   {e.burstWindows.filter(w => w.active || w.label !== "All").map((w, i) => {
                     const wColor = !w.active ? C.muted : w.pressure >= 100 ? C.red : w.pressure >= 80 ? C.orange : w.pressure >= 50 ? C.gold : C.dim;
+                    const gaugeWidth = e.pressureGaugeMax > 0 ? Math.min((w.pressure || 0) / e.pressureGaugeMax * 100, 100) : 0;
                     return (
-                      <div key={i} style={{background:C.surfaceAlt,borderRadius:"8px",padding:"10px 12px",
+                      <div key={i} style={{background:C.surfaceAlt,borderRadius:"8px",padding:"10px 12px",minWidth:0,
                         border:`1px solid ${w.pressure>=100?C.red+"30":w.pressure>=80?C.orange+"20":C.border}`}}>
                         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"4px"}}>
                           <span style={{fontSize:"10px",color:wColor,fontWeight:600,textTransform:"uppercase"}}>{w.label}</span>
                           <span style={{fontSize:"9px",color:C.muted}}>{w.sub} ({w.count})</span>
                         </div>
-                        <div style={{fontFamily:mono,fontSize:"20px",fontWeight:700,color:wColor}}>{w.active?`${w.pressure}%`:"—"}</div>
+                        <div style={{fontFamily:mono,fontSize:"20px",fontWeight:700,color:wColor}}>
+                          {w.active ? `${w.pressure.toFixed(1)}%` : "—"}
+                        </div>
                         {w.active && (
                           <>
-                            <div style={{fontSize:"9px",color:C.muted,marginTop:"2px"}}>{w.actual.toLocaleString()} / {w.theoretical.toLocaleString()}</div>
+                            <div style={{fontSize:"9px",color:C.muted,marginTop:"2px"}}>
+                              {Math.round(w.actual).toLocaleString()} / {Math.round(w.theoretical).toLocaleString()}
+                            </div>
                             <div style={{height:"4px",borderRadius:"2px",background:C.bg,marginTop:"6px",overflow:"hidden"}}>
-                              <div style={{height:"100%",borderRadius:"2px",width:`${Math.min((w.pressure||0)/2*100,100)}%`,
+                              <div style={{height:"100%",borderRadius:"2px",width:`${gaugeWidth}%`,
                                 background:w.pressure>=100?C.red:w.pressure>=80?C.orange:w.pressure>=50?C.gold:`${C.muted}40`}} />
                             </div>
                             {w.pressure < 100 && w.targetNum > 0 && (
@@ -845,7 +996,9 @@ const loadData = useCallback(async () => {
                               </div>
                             )}
                             {w.pressure >= 100 && (
-                              <div style={{fontSize:"9px",color:C.red,marginTop:"4px",fontWeight:600}}>IN DEBT</div>
+                              <div style={{fontSize:"9px",color:C.red,marginTop:"4px",fontWeight:600}}>
+                                IN DEBT · +{w.overExpectedPct.toFixed(1)}% · +{Math.round(w.overExpected).toLocaleString()} draws over expected
+                              </div>
                             )}
                           </>
                         )}
@@ -887,16 +1040,16 @@ const loadData = useCallback(async () => {
             <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:"10px",padding:"16px",marginBottom:"16px"}}>
               <div style={{fontSize:"12px",fontWeight:600,color:C.dim,textTransform:"uppercase",letterSpacing:"1px",marginBottom:"12px"}}>Confidence intervals</div>
               {e.ci.map((c,i)=>{
-                const maxD=e.ci[e.ci.length-1].drawNumber*1.05;
-                const curPct=(e.maxNum-e.lastWin)/(maxD-e.lastWin)*100;
-                const ciPct=(c.drawNumber-e.lastWin)/(maxD-e.lastWin)*100;
+                const maxD = e.ci[e.ci.length-1].drawNumber * 1.05;
+                const curPct = (e.maxNum - e.lastWin) / (maxD - e.lastWin) * 100;
+                const bandPct = c.target * 100;
                 return (<div key={i} style={{marginBottom:"8px"}}>
                   <div style={{display:"flex",justifyContent:"space-between",fontSize:"11px",marginBottom:"2px"}}>
                     <span style={{color:c.color,fontWeight:600}}>{c.label}</span>
                     <span style={{fontFamily:mono,color:c.passed?C.red:C.text}}>#{c.drawNumber.toLocaleString()} {c.passed?"✗ PASSED":`+${c.remaining.toLocaleString()} left`}</span>
                   </div>
                   <div style={{position:"relative",height:"14px",background:C.surfaceAlt,borderRadius:"3px",overflow:"hidden"}}>
-                    <div style={{position:"absolute",left:0,top:0,height:"100%",width:`${ciPct}%`,background:`${c.color}15`,borderRadius:"3px"}} />
+                    <div style={{position:"absolute",left:0,top:0,height:"100%",width:`${bandPct}%`,background:`linear-gradient(90deg, ${c.color}28, ${c.color}55)`,borderRadius:"3px"}} />
                     <div style={{position:"absolute",left:`${Math.min(curPct,100)}%`,top:0,height:"100%",width:"2px",background:C.gold,zIndex:2}} />
                   </div>
                 </div>);
@@ -907,30 +1060,53 @@ const loadData = useCallback(async () => {
             {e.gaps.length>0 && (
               <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:"10px",padding:"16px",marginBottom:"16px"}}>
                 <div style={{fontSize:"12px",fontWeight:600,color:C.dim,textTransform:"uppercase",letterSpacing:"1px",marginBottom:"10px"}}>Gap trend</div>
-                <ResponsiveContainer width="100%" height={200}>
+                <ResponsiveContainer width="100%" height={220}>
                   <ComposedChart data={gapTrend} margin={{top:5,right:5,bottom:5,left:0}}>
                     <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
                     <XAxis dataKey="label" tick={{fill:C.muted,fontSize:9}} />
                     <YAxis tick={{fill:C.muted,fontSize:9}} />
                     <Tooltip content={<CTip/>} />
-                    <Bar dataKey="gap" fill={C.gold} radius={[3,3,0,0]} opacity={0.7} name="Gap" />
-                    <Line type="monotone" dataKey="avg" stroke={C.green} strokeWidth={2} dot={false} name="Running avg" />
-                    <ReferenceLine y={e.statedGap} stroke={C.blue} strokeDasharray="5 5" />
+                    <Bar dataKey="gap" radius={[3,3,0,0]} opacity={0.9} name="Gap">
+                      {gapTrend.map((d, i) => <Cell key={i} fill={d.fill} />)}
+                    </Bar>
+                    <Line type="monotone" dataKey="avg" stroke={C.blue} strokeWidth={2} dot={false} name="Running avg" />
+                    <ReferenceLine y={Math.round(e.statedGap * 1.2)} stroke={C.orange} strokeDasharray="4 4" label={{ value: "120%", fill: C.orange, fontSize: 9, position: "insideTopRight" }} />
+                    <ReferenceLine y={e.statedGap} stroke={C.blue} strokeDasharray="5 5" label={{ value: "100%", fill: C.blue, fontSize: 9, position: "insideTopRight" }} />
+                    <ReferenceLine y={Math.round(e.statedGap * 0.8)} stroke={C.yellow} strokeDasharray="4 4" label={{ value: "80%", fill: C.yellow, fontSize: 9, position: "insideTopRight" }} />
                   </ComposedChart>
                 </ResponsiveContainer>
+                <div style={{display:"flex",gap:"14px",flexWrap:"wrap",marginTop:"8px",fontSize:"10px",color:C.muted}}>
+                  {[
+                    ["<80%", C.green],
+                    ["80–100%", C.yellow],
+                    ["100%", C.gray],
+                    ["100–120%", C.orange],
+                    [">120%", C.red],
+                  ].map(([label, color]) => (
+                    <span key={label} style={{display:"inline-flex",alignItems:"center",gap:"6px"}}>
+                      <span style={{width:"8px",height:"8px",borderRadius:"999px",background:color,display:"inline-block"}} />
+                      {label}
+                    </span>
+                  ))}
+                </div>
               </div>
             )}
 
             {/* Sweet Spot Radar */}
             {e.gapHistogram.length > 1 && (
               <div style={{background:C.surface,border:`1px solid ${C.gold}20`,borderRadius:"10px",padding:"16px",marginBottom:"16px"}}>
-                <div style={{fontSize:"12px",fontWeight:600,color:C.dim,textTransform:"uppercase",letterSpacing:"1px",marginBottom:"4px"}}>Sweet spot radar — win distribution</div>
+                <div style={{fontSize:"12px",fontWeight:600,color:C.dim,textTransform:"uppercase",letterSpacing:"1px",marginBottom:"4px"}}>
+                  Sweet spot radar — win distribution
+                </div>
+                <div style={{fontSize:"10px",color:C.muted,marginBottom:"10px"}}>
+                  Histogram bins are fixed at 20% of expected gap ({e.bucketSize.toLocaleString()} draws per band).
+                </div>
                 {e.sweetSpot && (
                   <div style={{fontSize:"12px",color:C.gold,marginBottom:"12px",fontWeight:500}}>
                     Highest probability entry zone: <span style={{fontFamily:mono,fontWeight:700}}>{e.sweetSpot.range}</span> range ({e.sweetSpot.count} wins, {e.sweetSpot.pct.toFixed(1)}%)
                   </div>
                 )}
-                <ResponsiveContainer width="100%" height={200}>
+                <ResponsiveContainer width="100%" height={220}>
                   <ComposedChart data={e.gapHistogram} margin={{top:5,right:5,bottom:5,left:0}}>
                     <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
                     <XAxis dataKey="range" tick={{fill:C.muted,fontSize:8}} angle={-30} textAnchor="end" height={55} interval={e.gapHistogram.length > 15 ? 1 : 0} />
@@ -939,23 +1115,56 @@ const loadData = useCallback(async () => {
                       if(!active||!payload?.length)return null;const d=payload[0].payload;
                       return(<div style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:"8px",padding:"8px 12px",fontSize:"11px"}}>
                         <div style={{color:C.text,fontWeight:600}}>Gap {d.range}</div>
-                        <div style={{color:C.gold,fontFamily:mono}}>{d.count} wins ({d.pct.toFixed(1)}%)</div>
+                        <div style={{color:d.fill,fontFamily:mono}}>{d.count} wins ({d.pct.toFixed(1)}%)</div>
+                        <div style={{color:C.dim,marginTop:"2px"}}>{(d.rangeMid / e.statedGap * 100).toFixed(0)}% of expected gap</div>
                       </div>);
                     }} />
                     <Bar dataKey="count" radius={[3,3,0,0]} name="Wins">
-                      {e.gapHistogram.map((d,i)=><Cell key={i} fill={e.sweetSpot && d.rangeStart===e.sweetSpot.rangeStart?C.gold:`${C.gold}40`} />)}
+                      {e.gapHistogram.map((d,i)=>(
+                        <Cell
+                          key={i}
+                          fill={d.fill}
+                          fillOpacity={e.sweetSpot && d.rangeStart===e.sweetSpot.rangeStart ? 1 : 0.78}
+                          stroke={e.sweetSpot && d.rangeStart===e.sweetSpot.rangeStart ? C.gold : "transparent"}
+                          strokeWidth={e.sweetSpot && d.rangeStart===e.sweetSpot.rangeStart ? 1.5 : 0}
+                        />
+                      ))}
                     </Bar>
                     {/* Current gap position indicator */}
                     {e.currentGap <= e.displayMax && (() => {
                       const binIdx = e.gapHistogram.findIndex(b => e.currentGap >= b.rangeStart && e.currentGap < b.rangeStart + e.bucketSize);
                       const targetBin = binIdx >= 0 ? e.gapHistogram[binIdx] : null;
-                      return targetBin ? <ReferenceLine x={targetBin.range} stroke={C.green} strokeWidth={2} strokeDasharray="4 4" label={{value:"YOU",fill:C.green,fontSize:9,position:"top"}} /> : null;
+                      const markerColor = getHistoryGapColor(e.currentGap, e.statedGap);
+                      return targetBin ? (
+                        <ReferenceLine
+                          x={targetBin.range}
+                          stroke={markerColor}
+                          strokeWidth={2}
+                          strokeDasharray="4 4"
+                          label={{value:"YOU",fill:markerColor,fontSize:9,position:"top"}}
+                        />
+                      ) : null;
                     })()}
+                    <ReferenceLine x={e.gapHistogram.find(b => b.rangeStart <= e.statedGap && e.statedGap < b.rangeStart + e.bucketSize)?.range} stroke={C.blue} strokeDasharray="5 5" />
                     <ReferenceLine y={0} stroke={C.border} />
                   </ComposedChart>
                 </ResponsiveContainer>
+                <div style={{display:"flex",gap:"14px",flexWrap:"wrap",marginTop:"8px",fontSize:"10px",color:C.muted}}>
+                  {[
+                    ["<80%", C.green],
+                    ["80–100%", C.yellow],
+                    ["100%", C.gray],
+                    ["100–120%", C.orange],
+                    [">120%", C.red],
+                  ].map(([label, color]) => (
+                    <span key={label} style={{display:"inline-flex",alignItems:"center",gap:"6px"}}>
+                      <span style={{width:"8px",height:"8px",borderRadius:"999px",background:color,display:"inline-block"}} />
+                      {label}
+                    </span>
+                  ))}
+                </div>
                 <div style={{fontSize:"10px",color:C.muted,marginTop:"6px"}}>
-                  {e.gapHistogram.length} bins shown. Green dashed line = your current gap position.
+                  {e.gapHistogram.length} bins shown. Dotted marker = your current gap position.
                   {e.currentGap > 0 && e.sweetSpot && (
                     <span style={{color: e.currentGap >= e.sweetSpot.rangeStart && e.currentGap < e.sweetSpot.rangeStart + e.bucketSize ? C.green : C.dim}}>
                       {e.currentGap >= e.sweetSpot.rangeStart && e.currentGap < e.sweetSpot.rangeStart + e.bucketSize
@@ -1275,18 +1484,7 @@ const loadData = useCallback(async () => {
                 </div>
                 {[...e.recs].reverse().map((r,i)=>{
                   const gapValue = i < e.gaps.length ? e.gaps[e.gaps.length - 1 - i] : null;
-                  const gapBand = getHistoryGapBand(gapValue, e.statedGap);
-                  const gapColor = gapBand === "low"
-                    ? C.green
-                    : gapBand === "nearLow"
-                      ? C.yellow
-                      : gapBand === "exact"
-                        ? C.gray
-                        : gapBand === "nearHigh"
-                          ? C.orange
-                          : gapBand === "high"
-                            ? C.red
-                            : C.dim;
+                  const gapColor = getHistoryGapColor(gapValue, e.statedGap);
 
                   return (
                     <div key={r.id} style={{display:"flex",alignItems:"center",padding:"6px 10px",borderRadius:"4px",background:i===0?C.goldGlow:"transparent",fontSize:"12px"}}>
@@ -1548,22 +1746,26 @@ const loadData = useCallback(async () => {
                 )}
 
                 {/* Burst Multi-Gauge — Vertical Bars */}
-                <div style={{display:"grid",gridTemplateColumns:`repeat(${e.burstWindows.filter(w=>w.active||w.label!=="All").length},1fr)`,gap:"5px",marginBottom:"10px",padding:"8px",borderRadius:"6px",
+                <div style={{display:"grid",gridTemplateColumns:`repeat(${e.burstWindows.filter(w=>w.active||w.label!=="All").length}, minmax(0, 1fr))`,gap:"6px",marginBottom:"10px",padding:"8px",borderRadius:"6px",
                   background:C.surfaceAlt,border:`1px solid ${e.allInDebt?C.gold+"40":C.border}`,
-                  boxShadow:e.allInDebt?`0 0 16px ${C.gold}18, inset 0 0 12px ${C.gold}06`:"none"}}>
+                  boxShadow:e.allInDebt?`0 0 16px ${C.gold}18, inset 0 0 12px ${C.gold}06`:"none",alignItems:"stretch"}}>
                   {e.burstWindows.filter(w => w.active || w.label !== "All").map((w,i) => {
-                    const wc = !w.active?C.muted:w.pressure>=100?C.red:w.pressure>=80?C.orange:w.pressure>=50?C.gold:C.dim;
-                    const pct = Math.min((w.pressure||0)/200*100, 100);
+                    const wc = !w.active ? C.muted : w.pressure >= 100 ? C.red : w.pressure >= 80 ? C.orange : w.pressure >= 50 ? C.gold : C.dim;
+                    const pct = e.pressureGaugeMax > 0 ? Math.min(((w.pressure || 0) / e.pressureGaugeMax) * 100, 100) : 0;
                     return (
-                      <div key={i} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:"3px"}}>
-                        <div style={{width:"100%",height:"36px",background:C.bg,borderRadius:"3px",overflow:"hidden",position:"relative",display:"flex",alignItems:"flex-end"}}>
-                          <div style={{width:"100%",height:`${pct}%`,borderRadius:"3px",transition:"height 0.4s ease",
+                      <div key={i} style={{display:"flex",flexDirection:"column",alignItems:"stretch",justifyContent:"space-between",gap:"4px",minWidth:0}}>
+                        <div style={{width:"100%",height:"38px",background:C.bg,borderRadius:"4px",overflow:"hidden",position:"relative",display:"flex",alignItems:"flex-end"}}>
+                          <div style={{width:"100%",height:`${pct}%`,borderRadius:"4px",transition:"height 0.4s ease",
                             background:w.pressure>=100?`linear-gradient(0deg,${C.orange},${C.red})`:w.pressure>=80?`linear-gradient(0deg,${C.gold}60,${C.orange})`:w.pressure>=50?`linear-gradient(0deg,${C.green}40,${C.gold}60)`:C.muted+"40",
                             boxShadow:w.pressure>=100?`0 0 6px ${C.red}30`:"none"}} />
                           {w.pressure>=100 && <div style={{position:"absolute",left:"50%",top:0,width:"1px",height:"100%",background:`${C.red}30`}} />}
                         </div>
-                        <div style={{fontSize:"10px",fontWeight:700,color:wc,fontFamily:mono}}>{w.active?`${w.pressure}%`:"—"}</div>
-                        <div style={{fontSize:"7px",color:C.muted,textTransform:"uppercase"}}>{w.label}</div>
+                        <div style={{fontSize:"9px",fontWeight:700,color:wc,fontFamily:mono,textAlign:"center",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",lineHeight:1.1}}>
+                          {w.active ? `${w.pressure.toFixed(1)}%` : "—"}
+                        </div>
+                        <div style={{fontSize:"7px",color:C.muted,textTransform:"uppercase",textAlign:"center",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",letterSpacing:"0.4px"}}>
+                          {w.label}
+                        </div>
                       </div>
                     );
                   })}
