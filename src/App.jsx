@@ -1552,68 +1552,21 @@ const loadData = useCallback(async () => {
                       content={({ active, payload }) => {
                         if (!active || !payload?.length) return null;
                         const d = payload[0].payload;
-                    
                         return (
-                          <div style={{ ...S.tooltipBox, minWidth: "220px" }}>
-                            <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
-                              {d.image_url ? (
-                                <img
-                                  src={d.image_url}
-                                  alt={d.fullName}
-                                  style={{
-                                    width: "52px",
-                                    height: "52px",
-                                    objectFit: "cover",
-                                    borderRadius: "8px",
-                                    border: `1px solid ${C.border}`,
-                                    background: C.surface,
-                                  }}
-                                />
-                              ) : null}
-
-                              <div style={{ minWidth: 0 }}>
-                                <div style={{ fontWeight: 700, color: C.text, marginBottom: "3px" }}>
-                                  {d.fullName}
-                                </div>
-                                <div style={{ fontSize: "11px", color: C.dim }}>
-                                  {d.wins} wins
-                                </div>
-                                <div style={{ fontSize: "11px", color: C.dim }}>
-                                  {formatCurrency(d.recovery_price)}
-                                </div>
-                                <div style={{ fontSize: "11px", color: C.dim }}>
-                                  Actual {formatPercent(d.actualPct, 2)} · Expected {formatPercent(d.expectedPct, 2)}
-                                </div>
-                              </div>
+                          <div style={S.tooltipBox}>
+                            <div style={{ fontWeight: 700, color: C.text, marginBottom: "4px" }}>
+                              Gap range: {d.range}
+                            </div>
+                            <div style={{ fontSize: "11px", color: C.gold, marginBottom: "2px" }}>
+                              {d.count} win{d.count !== 1 ? "s" : ""} ({d.pct.toFixed(1)}%)
+                            </div>
+                            <div style={{ fontSize: "11px", color: C.dim }}>
+                              Cumulative: {d.cumCount} win{d.cumCount !== 1 ? "s" : ""} ({d.cumPct.toFixed(1)}%)
                             </div>
                           </div>
                         );
                       }}
                     />
-                    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "10px", marginTop: "12px" }}>
-                      {itemChartData.map((d, i) => (
-                        <div key={`${d.fullName}-${i}`} style={{ ...S.statBox, display: "flex", gap: "10px", alignItems: "center" }}>
-                          {d.image_url ? (
-                            <img
-                              src={d.image_url}
-                              alt={d.fullName}
-                              style={{ width: "44px", height: "44px", objectFit: "cover", borderRadius: "8px", border: `1px solid ${C.border}` }}
-                            />
-                          ) : null}
-                          <div style={{ minWidth: 0 }}>
-                            <div style={{ fontSize: "12px", fontWeight: 700, color: C.text }}>
-                              {d.name}
-                            </div>
-                            <div style={{ fontSize: "11px", color: C.dim }}>
-                              {formatCurrency(d.recovery_price)}
-                            </div>
-                            <div style={{ fontSize: "11px", color: C.dim }}>
-                              {d.wins} wins
-                            </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
                     <Bar dataKey="count" radius={[3,3,0,0]} name="Wins">
                       {e.gapHistogram.map((d,i)=>(
                         <Cell
