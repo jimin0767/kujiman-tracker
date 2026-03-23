@@ -340,7 +340,7 @@ const loadData = useCallback(async () => {
       const API = KUJIMAN_API_BASE;
       const ts = () => Math.floor(Date.now() / 1000);
       const EXCLUDE_POOLS = new Set([922, 974, 735]);
-      const LIVE_CONCURRENCY = 20;
+      const LIVE_CONCURRENCY = 50;
 
       const evtRes = await fetch(`${API}/reward_pool_infinite?order_type=3&infinite_type_id=0&sort=0&time=${ts()}&os=4&client_env=h5`);
       const evtJson = await evtRes.json();
@@ -714,7 +714,7 @@ const loadData = useCallback(async () => {
       for (let b = 0; b < displayMax; b += bucketSize) {
         if (!gapBuckets[b]) gapBuckets[b] = 0;
       }
-      const gapHistogram = Object.entries(gapBuckets).map(([k, v]) => {
+      const rawGapHistogram = Object.entries(gapBuckets).map(([k, v]) => {
         const rangeStart = +k;
         const rangeMid = rangeStart + bucketSize / 2;
         return {
@@ -727,7 +727,43 @@ const loadData = useCallback(async () => {
           band: getHistoryGapBand(rangeMid, statedGap),
         };
       }).sort((a, b) => a.rangeStart - b.rangeStart);
+      
+      let runningCount = 0;
+      const gapHistogram = rawGapHistogram.map((bin) => {
+        runningCount += bin.count;
+        return {
+          ...bin,
+          cumCount: runningCount,
+          cumPct: gaps.length > 0 ? (runningCount / gaps.length) * 100 : 0,
+        };
+      });
+      
       const sweetSpot = gapHistogram.length > 0 ? gapHistogram.reduce((best, b) => b.count > best.count ? b : best, gapHistogram[0]) : null;
+
+      const bandTotals = gaps.reduce(
+        (acc, g) => {
+          const ratio = statedGap > 0 ? g / statedGap : 0;
+
+          if (ratio < 0.8) {
+            acc.lt80 += 1;
+          } else if (ratio < 1.0) {
+            acc.r80to100 += 1;
+          } else if (ratio <= 1.2) {
+            acc.r100to120 += 1;
+          } else {
+            acc.gt120 += 1;
+          }
+
+          return acc;
+        },
+        {
+          lt80: 0,
+          r80to100: 0,
+          r100to120: 0,
+          gt120: 0,
+        }
+      );
+
 
       // Soft Pity Analyzer: Empirical vs Theoretical (uses same tightened bins)
       const softPityData = gapHistogram.map(bin => {
@@ -747,7 +783,7 @@ const loadData = useCallback(async () => {
       return { ...ev, pid, recs, statedP, statedGap, price, maxNum, lastWin, currentGap,
         gaps, bayes, cumProb, ci, urgency, avgGap, predictions, consensus,
         itemStats, neverWon, lastWonItem, poolItems,
-        hardPity, hardPityPct, nearHardPity, gapHistogram, sweetSpot, bucketSize,
+        hardPity, hardPityPct, nearHardPity, gapHistogram, sweetSpot, bucketSize, bandTotals,
         softPityData, rubberBandData, displayMax, outlierCount,
         burstPressure, burstLevel, strategyHint, burstWindows, allInDebt, pressureGaugeMax,
         droughtStreak, springLoaded, debtRelease, recoveryBias };
@@ -1111,13 +1147,37 @@ const loadData = useCallback(async () => {
                     <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
                     <XAxis dataKey="range" tick={{fill:C.muted,fontSize:8}} angle={-30} textAnchor="end" height={55} interval={e.gapHistogram.length > 15 ? 1 : 0} />
                     <YAxis tick={{fill:C.muted,fontSize:9}} allowDecimals={false} />
-                    <Tooltip content={({active,payload})=>{
-                      if(!active||!payload?.length)return null;const d=payload[0].payload;
-                      return(<div style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:"8px",padding:"8px 12px",fontSize:"11px"}}>
-                        <div style={{color:C.text,fontWeight:600}}>Gap {d.range}</div>
-                        <div style={{color:d.fill,fontFamily:mono}}>{d.count} wins ({d.pct.toFixed(1)}%)</div>
-                        <div style={{color:C.dim,marginTop:"2px"}}>{(d.rangeMid / e.statedGap * 100).toFixed(0)}% of expected gap</div>
-                      </div>);
+                    <Tooltip content={({ active, payload }) => {
+                      if (!active || !payload?.length) return null;
+                      const d = payload[0].payload;
+
+                      return (
+                        <div
+                          style={{
+                            background: C.surfaceAlt,
+                            border: `1px solid ${C.border}`,
+                            borderRadius: "8px",
+                            padding: "8px 12px",
+                            fontSize: "11px",
+                          }}
+                        >
+                          <div style={{ color: C.text, fontWeight: 600 }}>
+                            Gap {d.range}
+                          </div>
+
+                          <div style={{ color: d.fill, fontFamily: mono }}>
+                            This band: {d.count} wins ({d.pct.toFixed(1)}%)
+                          </div>
+
+                          <div style={{ color: C.gold, fontFamily: mono, marginTop: "2px" }}>
+                            Cumulative: {d.cumCount} wins ({d.cumPct.toFixed(1)}%)
+                          </div>
+
+                          <div style={{ color: C.dim, marginTop: "2px" }}>
+                            {(d.rangeMid / e.statedGap * 100).toFixed(0)}% of expected gap
+                          </div>
+                        </div>
+                      );
                     }} />
                     <Bar dataKey="count" radius={[3,3,0,0]} name="Wins">
                       {e.gapHistogram.map((d,i)=>(
@@ -1145,7 +1205,7 @@ const loadData = useCallback(async () => {
                         />
                       ) : null;
                     })()}
-                    <ReferenceLine x={e.gapHistogram.find(b => b.rangeStart <= e.statedGap && e.statedGap < b.rangeStart + e.bucketSize)?.range} stroke={C.blue} strokeDasharray="5 5" />
+                    <ReferenceLine x={e.gapHistogram.find(b => b.rangeStart <= e.statedGap && e.statedGap < b.rangeStart + e.bucketSize)?.range} stroke={C.gray} strokeDasharray="5 5" label={{ value: "EXPECTED", fill: C.blue, fontSize: 9, position: "top" }}/>
                     <ReferenceLine y={0} stroke={C.border} />
                   </ComposedChart>
                 </ResponsiveContainer>
@@ -1163,8 +1223,48 @@ const loadData = useCallback(async () => {
                     </span>
                   ))}
                 </div>
+                
+                {/* new totals row */}
+                <div
+                  style={{
+                    display: "flex",
+                    gap: "14px",
+                    flexWrap: "wrap",
+                    marginTop: "6px",
+                    fontSize: "10px",
+                    color: C.muted,
+                  }}
+                >
+                  {[
+                    { label: "<80%", color: C.green, count: e.bandTotals.lt80 },
+                    { label: "80–100%", color: C.yellow, count: e.bandTotals.r80to100 },
+                    { label: "100–120%", color: C.orange, count: e.bandTotals.r100to120 },
+                    { label: ">120%", color: C.red, count: e.bandTotals.gt120 },
+                  ].map((item) => (
+                    <span
+                      key={item.label}
+                      style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}
+                    >
+                      <span
+                        style={{
+                          width: "8px",
+                          height: "8px",
+                          borderRadius: "999px",
+                          background: item.color,
+                          display: "inline-block",
+                        }}
+                      />
+                      {item.label}:{" "}
+                      <span style={{ color: C.text, fontFamily: mono }}>
+                        {item.count.toLocaleString()}
+                      </span>
+                    </span>
+                  ))}
+                </div>
+                
+
                 <div style={{fontSize:"10px",color:C.muted,marginTop:"6px"}}>
-                  {e.gapHistogram.length} bins shown. Dotted marker = your current gap position.
+                  {e.gapHistogram.length} bins shown. Colored dotted line = your current gap position. Blue dotted line = expected-gap reference band.
                   {e.currentGap > 0 && e.sweetSpot && (
                     <span style={{color: e.currentGap >= e.sweetSpot.rangeStart && e.currentGap < e.sweetSpot.rangeStart + e.bucketSize ? C.green : C.dim}}>
                       {e.currentGap >= e.sweetSpot.rangeStart && e.currentGap < e.sweetSpot.rangeStart + e.bucketSize
