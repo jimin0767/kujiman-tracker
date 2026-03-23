@@ -21,6 +21,70 @@ const HEADERS = {
 const mean = a => a.length ? a.reduce((s,v) => s+v, 0) / a.length : 0;
 const median = a => { if (!a.length) return 0; const s=[...a].sort((x,y)=>x-y), m=Math.floor(s.length/2); return s.length%2?s[m]:(s[m-1]+s[m])/2; };
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const sum = a => a.reduce((s, v) => s + v, 0);
+
+function normalizeType(value) {
+  return value ? String(value).trim().toUpperCase() : "UNKNOWN";
+}
+
+function percentile(sorted, p) {
+  if (!sorted.length) return 0;
+  const idx = (sorted.length - 1) * p;
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return sorted[lo];
+  const weight = idx - lo;
+  return sorted[lo] * (1 - weight) + sorted[hi] * weight;
+}
+
+function summarizeSeries(values) {
+  const clean = values.filter(v => Number.isFinite(v));
+  if (!clean.length) {
+    return { count:0, mean:0, median:0, q1:0, q3:0, min:0, max:0, variance:0, stdDev:0, iqr:0, cv:0 };
+  }
+  const sorted = [...clean].sort((a, b) => a - b);
+  const avg = mean(sorted);
+  const variance = sorted.length > 1
+    ? sorted.reduce((acc, value) => acc + (value - avg) ** 2, 0) / (sorted.length - 1)
+    : 0;
+  const q1 = percentile(sorted, 0.25);
+  const q3 = percentile(sorted, 0.75);
+  return {
+    count: sorted.length,
+    mean: avg,
+    median: median(sorted),
+    q1,
+    q3,
+    min: sorted[0],
+    max: sorted[sorted.length - 1],
+    variance,
+    stdDev: Math.sqrt(variance),
+    iqr: q3 - q1,
+    cv: avg !== 0 ? Math.sqrt(variance) / avg : 0,
+  };
+}
+
+function formatCurrency(value) {
+  return `₩${Math.round(Number(value) || 0).toLocaleString()}`;
+}
+
+function formatSignedCurrency(value) {
+  const amount = Number(value) || 0;
+  return `${amount >= 0 ? "+" : "-"}${formatCurrency(Math.abs(amount))}`;
+}
+
+function formatPercent(value, digits = 1) {
+  return `${(Number(value) || 0).toFixed(digits)}%`;
+}
+
+function cleanItemName(name, max = 60) {
+  return (name || "Unknown").replace(/^[^｜]*｜/, "").slice(0, max);
+}
+
+function typeSortOrder(type) {
+  const order = { UR: 1, SSR: 2, SR: 3, R: 4, N: 5 };
+  return order[type] ?? 999;
+}
 
 function getHistoryGapBand(gap, expectedGap) {
   if (!Number.isFinite(gap) || !Number.isFinite(expectedGap) || expectedGap <= 0) return "neutral";
@@ -222,6 +286,29 @@ async function sbInsert(table, payload, prefer = "") {
   return res;
 }
 
+async function sbFetchAll(table, query = "") {
+  const PAGE = 1000;
+  let offset = 0;
+  let rows = [];
+  while (true) {
+    const page = await sbFetch(table, `${query}${query ? "&" : ""}limit=${PAGE}&offset=${offset}`);
+    rows = rows.concat(page || []);
+    if (!page || page.length < PAGE) break;
+    offset += PAGE;
+  }
+  return rows;
+}
+
+async function sbPatch(table, query, payload, prefer = "") {
+  const res = await fetch(`${REST}/${table}?${query}`, {
+    method: "PATCH",
+    headers: prefer ? { ...HEADERS, Prefer: prefer } : HEADERS,
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(`${table} patch failed: ${res.status}`);
+  return res;
+}
+
 
 async function mapWithConcurrency(items, limit, worker) {
   const results = new Array(items.length);
@@ -308,11 +395,12 @@ export default function Dashboard() {
   const [events, setEvents] = useState([]);
   const [records, setRecords] = useState([]);
   const [items, setItems] = useState([]);
+  const [sections, setSections] = useState([]);
   const [snapshots, setSnapshots] = useState({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [selectedPool, setSelectedPool] = useState(null);
-  const [sortBy, setSortBy] = useState("urgency");
+  const [sortBy, setSortBy] = useState("poolDesc");
   const [filter, setFilter] = useState("");
   const [filterInput, setFilterInput] = useState("");
   const filterTimer = useRef(null);
@@ -338,28 +426,30 @@ export default function Dashboard() {
 const loadData = useCallback(async () => {
   try {
     setLoading(true);
-    const [evts, itms, snaps] = await Promise.all([
+    const [evts, itms, secs, snaps] = await Promise.all([
       sbFetch("events", "select=*&is_active=eq.true&order=reward_pool_id.desc"),
-      sbFetch("items", "select=*&reward_item_type=eq.UR&order=reward_pool_id,reward_item_id"),
+      sbFetchAll("items", "select=*&order=reward_pool_id.asc,reward_item_type.asc,reward_item_id.asc"),
+      sbFetchAll("event_rate_sections", "select=*&order=reward_pool_id.asc,reward_item_type.asc").catch(() => []),
       sbFetch("event_snapshots", "select=reward_pool_id,max_num_sort,collected_at&order=collected_at.desc&limit=200"),
     ]);
-    // Paginate win_records (Supabase caps at 1000 per request)
-    let allRecs = [], offset = 0;
-    const PAGE = 1000;
-    while (true) {
-      const page = await sbFetch("win_records",
-        `select=id,reward_pool_id,num_sort,create_time,nickname,reward_item_name,reward_item_id,reward_item_type&reward_item_type=eq.UR&order=reward_pool_id,num_sort.asc&limit=${PAGE}&offset=${offset}`);
-      allRecs = allRecs.concat(page || []);
-      if (!page || page.length < PAGE) break;
-      offset += PAGE;
-    }
-    setEvents(evts||[]); setRecords(allRecs); setItems(itms||[]);
+
+    const allRecs = await sbFetchAll(
+      "win_records",
+      "select=id,reward_pool_id,num_sort,create_time,nickname,reward_item_name,reward_item_id,reward_item_type,uid,avatar&reward_item_type=eq.UR&order=reward_pool_id.asc,num_sort.asc"
+    );
+
+    setEvents(evts || []);
+    setRecords(allRecs || []);
+    setItems(itms || []);
+    setSections(secs || []);
     const snapMap = {};
-    (snaps||[]).forEach(s => { if (!snapMap[s.reward_pool_id]) snapMap[s.reward_pool_id] = s; });
+    (snaps || []).forEach(s => { if (!snapMap[s.reward_pool_id]) snapMap[s.reward_pool_id] = s; });
     setSnapshots(snapMap);
     setLastRefresh(new Date());
     setError(null);
-  } catch (e) { setError(e.message); }
+  } catch (e) {
+    setError(e.message);
+  }
   setLoading(false);
 }, []);
 
@@ -376,8 +466,8 @@ const loadData = useCallback(async () => {
     try {
       const API = KUJIMAN_API_BASE;
       const ts = () => Math.floor(Date.now() / 1000);
-      const EXCLUDE_POOLS = new Set([922, 974, 735]);
-      const LIVE_CONCURRENCY = 50;
+      const EXCLUDE_POOLS = new Set([974, 735]);
+      const LIVE_CONCURRENCY = 25;
 
       const evtRes = await fetch(`${API}/reward_pool_infinite?order_type=3&infinite_type_id=0&sort=0&time=${ts()}&os=4&client_env=h5`);
       const evtJson = await evtRes.json();
@@ -581,6 +671,12 @@ const loadData = useCallback(async () => {
     return m;
   }, [items]);
 
+  const sectionsByPool = useMemo(() => {
+    const m = {};
+    sections.forEach(sec => { if (!m[sec.reward_pool_id]) m[sec.reward_pool_id] = []; m[sec.reward_pool_id].push(sec); });
+    return m;
+  }, [sections]);
+
   /* ═══ COMPUTE ═══ */
   const eventData = useMemo(() => {
     const byPool = {};
@@ -699,24 +795,105 @@ const loadData = useCallback(async () => {
 
       const recoveryBias = computeRecoveryBias(gaps, currentGap, statedP);
 
-      // Item frequency
-      const poolItems = itemsByPool[pid] || [];
+      // Item + rarity stats
+      const poolItems = (itemsByPool[pid] || []).slice().sort((a, b) => {
+        const typeCmp = typeSortOrder(normalizeType(a.reward_item_type)) - typeSortOrder(normalizeType(b.reward_item_type));
+        if (typeCmp !== 0) return typeCmp;
+        return (Number(a.display_order) || 9999) - (Number(b.display_order) || 9999) || ((a.reward_item_id || 0) - (b.reward_item_id || 0));
+      });
+      const poolSections = sectionsByPool[pid] || [];
+      const urPoolItems = poolItems.filter(it => normalizeType(it.reward_item_type) === "UR");
       const itemWinCounts = {};
-      recs.forEach(r => { if (r.reward_item_id) itemWinCounts[r.reward_item_id] = (itemWinCounts[r.reward_item_id]||0)+1; });
+      recs.forEach(r => { if (r.reward_item_id) itemWinCounts[r.reward_item_id] = (itemWinCounts[r.reward_item_id] || 0) + 1; });
 
-      const itemStats = poolItems.map(it => {
+      const itemStats = urPoolItems.map(it => {
         const wins = itemWinCounts[it.reward_item_id] || 0;
         const totalWins = recs.length;
-        const expectedPct = totalWins > 0 && poolItems.length > 0 ? 100 / poolItems.length : 0;
+        const expectedPct = totalWins > 0 && urPoolItems.length > 0 ? 100 / urPoolItems.length : 0;
         const actualPct = totalWins > 0 ? (wins / totalWins * 100) : 0;
         const luck = expectedPct > 0 ? actualPct / expectedPct : 1;
         return { ...it, wins, totalWins, expectedPct, actualPct, luck };
-      }).sort((a,b) => b.wins - a.wins);
+      }).sort((a,b) => b.wins - a.wins || ((Number(b.recovery_price) || 0) - (Number(a.recovery_price) || 0)));
 
-      // Items never won (within our data)
       const neverWon = itemStats.filter(i => i.wins === 0);
+      const leastUrWins = itemStats.length ? Math.min(...itemStats.map(i => i.wins)) : 0;
+      const leastPickedUrItems = itemStats.filter(i => i.wins === leastUrWins);
 
-      // Last won item
+      const sectionRateMap = {};
+      poolSections.forEach(sec => {
+        const type = normalizeType(sec.reward_item_type);
+        const rate = Number(sec.infinite_rate);
+        if (Number.isFinite(rate)) sectionRateMap[type] = rate;
+      });
+      poolItems.forEach(it => {
+        const type = normalizeType(it.reward_item_type);
+        const rate = Number(it.section_rate);
+        if (sectionRateMap[type] == null && Number.isFinite(rate)) sectionRateMap[type] = rate;
+      });
+      if (ev.rate_snapshot && typeof ev.rate_snapshot === "object") {
+        Object.entries(ev.rate_snapshot).forEach(([type, rate]) => {
+          const num = Number(rate);
+          if (sectionRateMap[type] == null && Number.isFinite(num)) sectionRateMap[type] = num;
+        });
+      }
+
+      const itemsGroupedByType = {};
+      poolItems.forEach(it => {
+        const type = normalizeType(it.reward_item_type);
+        if (!itemsGroupedByType[type]) itemsGroupedByType[type] = [];
+        itemsGroupedByType[type].push(it);
+      });
+
+      const knownTypes = new Set([
+        ...Object.keys(itemsGroupedByType),
+        ...Object.keys(sectionRateMap),
+        ...Object.keys(ev.item_type_counts || {}),
+      ]);
+
+      const sectionStats = [...knownTypes]
+        .sort((a, b) => typeSortOrder(a) - typeSortOrder(b) || a.localeCompare(b))
+        .map(type => {
+          const typeItems = itemsGroupedByType[type] || [];
+          const pricedValues = typeItems.map(it => Number(it.recovery_price)).filter(v => Number.isFinite(v));
+          const priceSummary = summarizeSeries(pricedValues);
+          const sectionRate = Number(sectionRateMap[type]) || 0;
+          const avgPrice = priceSummary.mean || 0;
+          const evContribution = avgPrice * (sectionRate / 100);
+          return {
+            type,
+            itemCount: typeItems.length || Number(ev.item_type_counts?.[type]) || 0,
+            pricedCount: priceSummary.count,
+            sectionRate,
+            avgPrice,
+            medianPrice: priceSummary.median || 0,
+            minPrice: priceSummary.min || 0,
+            maxPrice: priceSummary.max || 0,
+            priceStdDev: priceSummary.stdDev || 0,
+            evContribution,
+            items: typeItems,
+          };
+        });
+
+      const expectedValue = sum(sectionStats.map(stat => stat.evContribution));
+      const expectedProfit = expectedValue - price;
+      const expectedROI = price > 0 ? (expectedProfit / price) * 100 : 0;
+      const urSection = sectionStats.find(stat => stat.type === "UR") || null;
+      const leastPickedUrAvgPrice = leastPickedUrItems.length
+        ? mean(leastPickedUrItems.map(it => Number(it.recovery_price)).filter(v => Number.isFinite(v)))
+        : 0;
+      const leastPickedUrExpectedValue = urSection
+        ? expectedValue - urSection.evContribution + (((urSection.sectionRate || 0) / 100) * leastPickedUrAvgPrice)
+        : expectedValue;
+      const leastPickedUrProfit = leastPickedUrExpectedValue - price;
+      const leastPickedUrROI = price > 0 ? (leastPickedUrProfit / price) * 100 : 0;
+
+      const gapStats = summarizeSeries(gaps);
+      const recentGapStats = summarizeSeries(gaps.slice(-10));
+      const allItemPriceStats = summarizeSeries(poolItems.map(it => Number(it.recovery_price)).filter(v => Number.isFinite(v)));
+      const urItemPriceStats = summarizeSeries(urPoolItems.map(it => Number(it.recovery_price)).filter(v => Number.isFinite(v)));
+      const urExpectedSharePct = itemStats.length ? 100 / itemStats.length : 0;
+      const urWinConcentration = recs.length ? itemStats.reduce((acc, it) => acc + (it.actualPct / 100) ** 2, 0) : 0;
+
       const lastWonItem = recs.length ? recs[recs.length-1] : null;
 
       const predictions = [
@@ -813,22 +990,36 @@ const loadData = useCallback(async () => {
 
       return { ...ev, pid, recs, statedP, statedGap, price, maxNum, lastWin, currentGap,
         gaps, bayes, cumProb, ci, urgency, avgGap, predictions, consensus,
-        itemStats, neverWon, lastWonItem, poolItems,
+        itemStats, neverWon, leastPickedUrItems, leastUrWins, lastWonItem, poolItems, urPoolItems, poolSections, sectionStats,
+        expectedValue, expectedProfit, expectedROI, leastPickedUrAvgPrice, leastPickedUrExpectedValue, leastPickedUrProfit, leastPickedUrROI,
+        gapStats, recentGapStats, allItemPriceStats, urItemPriceStats, urExpectedSharePct, urWinConcentration,
         hardPity, hardPityPct, nearHardPity, gapHistogram, sweetSpot, bucketSize, bandTotals,
         softPityData, rubberBandData, displayMax, outlierCount,
         burstPressure, burstLevel, strategyHint, burstWindows, allInDebt, pressureGaugeMax,
         droughtStreak, springLoaded, debtRelease, recoveryBias };
     });
-  }, [events, records, snapshots, itemsByPool]);
+  }, [events, records, snapshots, itemsByPool, sectionsByPool]);
 
   const sortedEvents = useMemo(() => {
-    let filtered = eventData.filter(e => !filter || e.event_name.toLowerCase().includes(filter.toLowerCase()));
-    const sorters = { urgency:(a,b)=>b.urgency-a.urgency, name:(a,b)=>a.event_name.localeCompare(b.event_name), cumProb:(a,b)=>b.cumProb-a.cumProb, records:(a,b)=>b.recs.length-a.recs.length, gap:(a,b)=>b.currentGap-a.currentGap, poolDesc:(a,b)=>b.pid-a.pid };
-    const baseSorter = sorters[sortBy] || sorters.urgency;
+    const filtered = eventData.filter(
+      e => !filter || e.event_name.toLowerCase().includes(filter.toLowerCase())
+    );
+
+    const sorters = {
+      poolDesc: (a, b) => b.pid - a.pid,
+      pressure: (a, b) => b.burstPressure - a.burstPressure || b.pid - a.pid,
+      records: (a, b) => b.recs.length - a.recs.length || b.pid - a.pid,
+      name: (a, b) => a.event_name.localeCompare(b.event_name) || b.pid - a.pid,
+      gap: (a, b) => b.currentGap - a.currentGap || b.pid - a.pid,
+    };
+
+    const baseSorter = sorters[sortBy] || sorters.poolDesc;
+
     return [...filtered].sort((a, b) => {
       const aFav = favorites.includes(a.pid) ? 1 : 0;
       const bFav = favorites.includes(b.pid) ? 1 : 0;
-      if (aFav !== bFav) return bFav - aFav;
+
+      if (aFav !== bFav) return bFav - aFav; // keep favorites pinned first
       return baseSorter(a, b);
     });
   }, [eventData, sortBy, filter, favorites]);
@@ -895,6 +1086,7 @@ const loadData = useCallback(async () => {
   /* ════════════════════════════════════════════ */
   if (sel) {
     const e = sel;
+    const isFav = favorites.includes(e.pid);
     const gapTrend = e.gaps.map((g, i) => ({
       idx: i + 1,
       gap: g,
@@ -909,8 +1101,8 @@ const loadData = useCallback(async () => {
 
     // Item frequency chart data
     const itemChartData = e.itemStats.filter(i => i.wins > 0).map((it, idx) => ({
-      name: (it.reward_item_name || "Unknown").replace(/^[^｜]*｜/, "").slice(0, 25),
-      fullName: it.reward_item_name || "Unknown",
+      name: cleanItemName(it.reward_item_name, 25),
+      fullName: cleanItemName(it.reward_item_name, 100),
       wins: it.wins,
       fill: ITEM_COLORS[idx % ITEM_COLORS.length],
     }));
@@ -918,7 +1110,8 @@ const loadData = useCallback(async () => {
 
     const tabs = [
       { id: "overview", label: "Overview" },
-      { id: "items", label: `UR Items (${e.poolItems.length})` },
+      { id: "statistics", label: "Statistics" },
+      { id: "items", label: `Items (${e.poolItems.length})` },
       { id: "history", label: `History (${e.recs.length})` },
     ];
 
@@ -929,12 +1122,40 @@ const loadData = useCallback(async () => {
           <button onClick={()=>{setSelectedPool(null);setDetailTab("overview");setSingleLiveStatus("");}} style={{...baseBtn,background:C.surfaceAlt,color:C.dim,padding:"8px 14px",border:`1px solid ${C.border}`}}>← Back</button>
           <div style={{flex:1}}>
             <h1 style={{fontSize:"20px",fontWeight:700,color:C.gold,margin:0}}>{e.event_name}</h1>
-            <div style={{fontSize:"12px",color:C.dim,marginTop:"2px"}}>Pool {e.pid} · UR {(e.statedP*100).toFixed(2)}% · ₩{e.price?.toLocaleString()}/draw · {e.recs.length} records · {e.poolItems.length} UR items</div>
+            <div style={{fontSize:"12px",color:C.dim,marginTop:"2px"}}>Pool {e.pid} · UR {(e.statedP*100).toFixed(2)}% · {formatCurrency(e.price)}/draw · {e.recs.length} UR records · {e.poolItems.length} items · {e.sectionStats.length} rarity sections</div>
           </div>
-          <button onClick={()=>liveFetchSingle(e.pid, e.event_name)} disabled={singleLiveLoading}
-            style={{...baseBtn,background:singleLiveLoading?C.surfaceAlt:C.gold,color:singleLiveLoading?C.dim:"#000",padding:"8px 16px",flexShrink:0}}>
+          <button
+            onClick={() => toggleFav(e.pid)}
+            style={{
+              ...baseBtn,
+              background: favorites.includes(e.pid) ? `${C.gold}18` : C.surfaceAlt,
+              color: favorites.includes(e.pid) ? C.gold : C.dim,
+              border: `1px solid ${favorites.includes(e.pid) ? C.gold + "50" : C.border}`,
+              padding: "8px 12px",
+              minWidth: "42px",
+              fontSize: "16px",
+              lineHeight: 1,
+              flexShrink: 0,
+            }}
+            title={favorites.includes(e.pid) ? "Remove from favorites" : "Add to favorites"}
+          >
+            {favorites.includes(e.pid) ? "★" : "☆"}
+          </button>
+
+          <button
+            onClick={() => liveFetchSingle(e.pid, e.event_name)}
+            disabled={singleLiveLoading}
+            style={{
+              ...baseBtn,
+              background: singleLiveLoading ? C.surfaceAlt : C.gold,
+              color: singleLiveLoading ? C.dim : "#000",
+              padding: "8px 16px",
+              flexShrink: 0,
+            }}
+          >
             {singleLiveLoading ? "Fetching..." : "⚡ Live"}
           </button>
+          
           <div style={{textAlign:"right"}}>
             <div style={{fontSize:"11px",color:C.dim}}>CONSENSUS</div>
             <div style={{fontSize:"24px",fontWeight:700,fontFamily:mono,color:C.gold}}>#{e.consensus.toLocaleString()}</div>
@@ -1512,6 +1733,200 @@ const loadData = useCallback(async () => {
             </div>
           </>)}
 
+          {/* ═══ STATISTICS TAB ═══ */}
+          {detailTab === "statistics" && (<>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:"10px",marginBottom:"16px"}}>
+              {[
+                { l:"Mean gap", v: Math.round(e.gapStats.mean).toLocaleString(), c:C.blue },
+                { l:"Median gap", v: Math.round(e.gapStats.median).toLocaleString(), c:C.cyan },
+                { l:"Q1 / Q3", v: `${Math.round(e.gapStats.q1).toLocaleString()} / ${Math.round(e.gapStats.q3).toLocaleString()}`, c:C.dim },
+                { l:"Min / Max", v: `${Math.round(e.gapStats.min).toLocaleString()} / ${Math.round(e.gapStats.max).toLocaleString()}`, c:C.text },
+                { l:"Variance", v: e.gapStats.variance.toFixed(1), c:C.orange },
+                { l:"Std dev", v: e.gapStats.stdDev.toFixed(1), c:C.yellow },
+                { l:"IQR", v: e.gapStats.iqr.toFixed(1), c:C.green },
+                { l:"Recent mean (10)", v: Math.round(e.recentGapStats.mean || 0).toLocaleString(), c:C.purple },
+              ].map((stat, idx) => (
+                <div key={idx} style={S.statBox}>
+                  <div style={S.label}>{stat.l}</div>
+                  <div style={{...S.monoValue,color:stat.c,fontSize:"17px"}}>{stat.v}</div>
+                </div>
+              ))}
+            </div>
+
+            <div style={S.card}>
+              <div style={S.sectionTitle}>Expected value by rarity</div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(170px,1fr))",gap:"10px",marginBottom:"14px"}}>
+                <div style={S.statBox}>
+                  <div style={S.label}>EV / draw</div>
+                  <div style={{...S.monoValue,color:e.expectedValue >= e.price ? C.green : C.red}}>{formatCurrency(e.expectedValue)}</div>
+                </div>
+                <div style={S.statBox}>
+                  <div style={S.label}>Expected profit</div>
+                  <div style={{...S.monoValue,color:e.expectedProfit >= 0 ? C.green : C.red}}>{formatSignedCurrency(e.expectedProfit)}</div>
+                </div>
+                <div style={S.statBox}>
+                  <div style={S.label}>Expected ROI</div>
+                  <div style={{...S.monoValue,color:e.expectedROI >= 0 ? C.green : C.red}}>{formatPercent(e.expectedROI, 1)}</div>
+                </div>
+                <div style={S.statBox}>
+                  <div style={S.label}>All-item avg price</div>
+                  <div style={{...S.monoValue,color:C.gold}}>{formatCurrency(e.allItemPriceStats.mean)}</div>
+                </div>
+              </div>
+
+              <div style={{height:Math.max(220, e.sectionStats.length * 44 + 40)}}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={e.sectionStats.map(stat => ({
+                    type: stat.type,
+                    contribution: Math.round(stat.evContribution),
+                    sectionRate: stat.sectionRate,
+                    avgPrice: Math.round(stat.avgPrice),
+                  }))} layout="vertical" margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+                    <XAxis type="number" tick={{ fill:C.muted, fontSize:10 }} />
+                    <YAxis type="category" dataKey="type" tick={{ fill:C.dim, fontSize:11 }} width={60} />
+                    <Tooltip content={({active,payload}) => {
+                      if (!active || !payload?.length) return null;
+                      const d = payload[0].payload;
+                      return (<div style={S.tooltipBox}>
+                        <div style={{color:C.text,fontWeight:700,marginBottom:"4px"}}>{d.type}</div>
+                        <div style={{color:C.gold}}>EV contribution: {formatCurrency(d.contribution)}</div>
+                        <div style={{color:C.dim}}>Section rate: {formatPercent(d.sectionRate, 2)}</div>
+                        <div style={{color:C.dim}}>Avg item price: {formatCurrency(d.avgPrice)}</div>
+                      </div>);
+                    }} />
+                    <Bar dataKey="contribution" name="EV contribution" radius={[0,4,4,0]}>
+                      {e.sectionStats.map((stat, idx) => <Cell key={stat.type} fill={ITEM_COLORS[idx % ITEM_COLORS.length]} />)}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+
+              <div style={{display:"grid",gridTemplateColumns:"1.2fr 0.8fr 0.8fr 1fr 1fr",gap:"8px",marginTop:"14px"}}>
+                <div style={{fontSize:"10px",color:C.muted,textTransform:"uppercase"}}>Rarity</div>
+                <div style={{fontSize:"10px",color:C.muted,textTransform:"uppercase"}}>Rate</div>
+                <div style={{fontSize:"10px",color:C.muted,textTransform:"uppercase"}}>Items</div>
+                <div style={{fontSize:"10px",color:C.muted,textTransform:"uppercase"}}>Avg price</div>
+                <div style={{fontSize:"10px",color:C.muted,textTransform:"uppercase"}}>EV contrib.</div>
+                {e.sectionStats.flatMap((stat, idx) => [
+                  <div key={`${stat.type}-type`} style={{padding:"8px 10px",borderRadius:"8px",background:C.surfaceAlt,border:`1px solid ${C.border}`,display:"flex",alignItems:"center",gap:"8px"}}>
+                    <span style={{...S.legendDot, background:ITEM_COLORS[idx % ITEM_COLORS.length]}} />
+                    <span style={{fontWeight:700,color:C.text}}>{stat.type}</span>
+                  </div>,
+                  <div key={`${stat.type}-rate`} style={{padding:"8px 10px",borderRadius:"8px",background:C.surfaceAlt,border:`1px solid ${C.border}`,fontFamily:mono,fontSize:"12px",display:"flex",alignItems:"center"}}>{formatPercent(stat.sectionRate, 2)}</div>,
+                  <div key={`${stat.type}-count`} style={{padding:"8px 10px",borderRadius:"8px",background:C.surfaceAlt,border:`1px solid ${C.border}`,fontFamily:mono,fontSize:"12px",display:"flex",alignItems:"center"}}>{stat.itemCount.toLocaleString()}</div>,
+                  <div key={`${stat.type}-avg`} style={{padding:"8px 10px",borderRadius:"8px",background:C.surfaceAlt,border:`1px solid ${C.border}`,fontFamily:mono,fontSize:"12px",display:"flex",alignItems:"center"}}>{formatCurrency(stat.avgPrice)}</div>,
+                  <div key={`${stat.type}-ev`} style={{padding:"8px 10px",borderRadius:"8px",background:C.surfaceAlt,border:`1px solid ${C.border}`,fontFamily:mono,fontSize:"12px",display:"flex",alignItems:"center",color:stat.evContribution >= 0 ? C.green : C.red}}>{formatCurrency(stat.evContribution)}</div>,
+                ])}
+              </div>
+            </div>
+
+            <div style={{...S.card, background:`linear-gradient(135deg,${C.cyan}08,${C.surface})`, border:`1px solid ${C.cyan}25`}}>
+              <div style={{...S.sectionTitle, color:C.cyan}}>Least-picked UR EV scenario</div>
+              <div style={{fontSize:"11px",color:C.dim,lineHeight:1.6,marginBottom:"12px"}}>
+                This view keeps SSR / SR / R / N the same, then swaps only the UR bucket average for the average recovery price of every UR item tied for the lowest observed pick count.
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(170px,1fr))",gap:"10px",marginBottom:"14px"}}>
+                <div style={S.statBox}>
+                  <div style={S.label}>Least-picked UR count</div>
+                  <div style={{...S.monoValue,color:C.cyan}}>{e.leastPickedUrItems.length.toLocaleString()}</div>
+                </div>
+                <div style={S.statBox}>
+                  <div style={S.label}>Least-picked UR wins</div>
+                  <div style={{...S.monoValue,color:C.cyan}}>{e.leastUrWins.toLocaleString()}</div>
+                </div>
+                <div style={S.statBox}>
+                  <div style={S.label}>Least-picked UR avg price</div>
+                  <div style={{...S.monoValue,color:C.gold}}>{formatCurrency(e.leastPickedUrAvgPrice)}</div>
+                </div>
+                <div style={S.statBox}>
+                  <div style={S.label}>Cold-UR EV / draw</div>
+                  <div style={{...S.monoValue,color:e.leastPickedUrExpectedValue >= e.price ? C.green : C.red}}>{formatCurrency(e.leastPickedUrExpectedValue)}</div>
+                </div>
+                <div style={S.statBox}>
+                  <div style={S.label}>Cold-UR ROI</div>
+                  <div style={{...S.monoValue,color:e.leastPickedUrROI >= 0 ? C.green : C.red}}>{formatPercent(e.leastPickedUrROI, 1)}</div>
+                </div>
+              </div>
+
+              {e.leastPickedUrItems.length > 0 ? (
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(240px,1fr))",gap:"8px"}}>
+                  {e.leastPickedUrItems.map((item, idx) => (
+                    <div key={item.reward_item_id || idx} style={{display:"flex",gap:"10px",padding:"10px",borderRadius:"8px",background:C.surfaceAlt,border:`1px solid ${C.border}`}}>
+                      {item.image_url && <img src={item.image_url} style={{width:"50px",height:"50px",objectFit:"contain",borderRadius:"6px",background:C.bg,flexShrink:0}} />}
+                      <div style={{minWidth:0,flex:1}}>
+                        <div style={{fontSize:"11px",fontWeight:700,color:C.text,lineHeight:1.35}}>{cleanItemName(item.reward_item_name, 70)}</div>
+                        <div style={{fontSize:"10px",color:C.gold,fontFamily:mono,marginTop:"4px"}}>{formatCurrency(item.recovery_price)}</div>
+                        <div style={{fontSize:"10px",color:C.dim,marginTop:"4px"}}>{item.wins} wins · actual {item.actualPct.toFixed(1)}% · expected {item.expectedPct.toFixed(1)}%</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div style={{fontSize:"11px",color:C.dim}}>No UR item frequency history yet for this event.</div>
+              )}
+            </div>
+
+            <div style={S.card}>
+              <div style={S.sectionTitle}>Useful EDA</div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(170px,1fr))",gap:"10px",marginBottom:"14px"}}>
+                <div style={S.statBox}>
+                  <div style={S.label}>UR items</div>
+                  <div style={{...S.monoValue,color:C.text}}>{e.urPoolItems.length.toLocaleString()}</div>
+                </div>
+                <div style={S.statBox}>
+                  <div style={S.label}>Equal-share UR pct</div>
+                  <div style={{...S.monoValue,color:C.purple}}>{formatPercent(e.urExpectedSharePct, 1)}</div>
+                </div>
+                <div style={S.statBox}>
+                  <div style={S.label}>UR price mean</div>
+                  <div style={{...S.monoValue,color:C.gold}}>{formatCurrency(e.urItemPriceStats.mean)}</div>
+                </div>
+                <div style={S.statBox}>
+                  <div style={S.label}>UR price std dev</div>
+                  <div style={{...S.monoValue,color:C.orange}}>{formatCurrency(e.urItemPriceStats.stdDev)}</div>
+                </div>
+                <div style={S.statBox}>
+                  <div style={S.label}>UR win concentration</div>
+                  <div style={{...S.monoValue,color:C.cyan}}>{e.urWinConcentration.toFixed(3)}</div>
+                </div>
+              </div>
+
+              {e.itemStats.length > 0 ? (
+                <ResponsiveContainer width="100%" height={Math.max(240, e.itemStats.length * 24 + 60)}>
+                  <BarChart data={e.itemStats.map((item, idx) => ({
+                    name: cleanItemName(item.reward_item_name, 24),
+                    fullName: cleanItemName(item.reward_item_name, 100),
+                    wins: item.wins,
+                    actualPct: Number(item.actualPct.toFixed(2)),
+                    expectedPct: Number(item.expectedPct.toFixed(2)),
+                    fill: ITEM_COLORS[idx % ITEM_COLORS.length],
+                  }))} layout="vertical" margin={{ top: 5, right: 30, left: 10, bottom: 5 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+                    <XAxis type="number" tick={{ fill:C.muted, fontSize:10 }} />
+                    <YAxis type="category" dataKey="name" tick={{ fill:C.dim, fontSize:10 }} width={170} />
+                    <Tooltip content={({active,payload}) => {
+                      if (!active || !payload?.length) return null;
+                      const d = payload[0].payload;
+                      return (<div style={S.tooltipBox}>
+                        <div style={{color:C.text,fontWeight:700,marginBottom:"4px"}}>{d.fullName}</div>
+                        <div style={{color:C.gold}}>Wins: {d.wins}</div>
+                        <div style={{color:C.dim}}>Actual share: {formatPercent(d.actualPct, 2)}</div>
+                        <div style={{color:C.dim}}>Equal-share baseline: {formatPercent(d.expectedPct, 2)}</div>
+                      </div>);
+                    }} />
+                    <Bar dataKey="actualPct" name="Actual share %" radius={[0,4,4,0]}>
+                      {e.itemStats.map((item, idx) => <Cell key={item.reward_item_id || idx} fill={ITEM_COLORS[idx % ITEM_COLORS.length]} />)}
+                    </Bar>
+                    <ReferenceLine x={e.urExpectedSharePct} stroke={C.gold} strokeDasharray="4 4" />
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : (
+                <div style={{fontSize:"11px",color:C.dim}}>Need at least one UR record before the UR item balance chart becomes meaningful.</div>
+              )}
+            </div>
+          </>)}
+
           {/* ═══ ITEMS TAB ═══ */}
           {detailTab === "items" && (<>
             {/* Item Win Frequency Chart */}
@@ -1543,7 +1958,7 @@ const loadData = useCallback(async () => {
               <div style={{background:`linear-gradient(135deg,${C.purple}08,${C.surface})`,border:`1px solid ${C.purple}25`,borderRadius:"10px",padding:"16px",marginBottom:"16px"}}>
                 <div style={{fontSize:"12px",fontWeight:600,color:C.purple,textTransform:"uppercase",letterSpacing:"1px",marginBottom:"4px"}}>Next item prediction</div>
                 <div style={{fontSize:"11px",color:C.dim,marginBottom:"12px"}}>
-                  If items are equally likely ({(100/e.poolItems.length).toFixed(1)}% each), items won less often are statistically "due" — though each draw is independent.
+                  If UR items are equally likely within the UR bucket ({(100/Math.max(e.urPoolItems.length, 1)).toFixed(1)}% each), items won less often are statistically "due" — though each draw is independent.
                 </div>
                 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"10px"}}>
                   {e.itemStats.slice(-3).reverse().map((it,i) => (
@@ -1560,7 +1975,7 @@ const loadData = useCallback(async () => {
                 </div>
                 {e.neverWon.length > 0 && (
                   <div style={{marginTop:"12px",fontSize:"11px",color:C.green}}>
-                    {e.neverWon.length} item(s) never won in our data — may appear next
+                    {e.neverWon.length} UR item(s) never won in our data — possible cold candidates
                   </div>
                 )}
               </div>
@@ -1568,30 +1983,33 @@ const loadData = useCallback(async () => {
 
             {/* Full Item List */}
             <div style={{...S.card, marginBottom:0}}>
-              <div style={{...S.sectionTitle}}>All UR items ({e.poolItems.length})</div>
+              <div style={{...S.sectionTitle}}>All event-page items ({e.poolItems.length})</div>
               <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:"8px"}}>
-                {e.itemStats.map((it,i) => {
-                  const isNever = it.wins === 0;
-                  const isHot = it.luck > 1.5;
-                  const isCold = it.luck < 0.5 && it.wins > 0;
+                {e.poolItems.map((it,i) => {
+                  const rarity = normalizeType(it.reward_item_type);
+                  const urStat = rarity === "UR" ? e.itemStats.find(stat => stat.reward_item_id === it.reward_item_id) : null;
+                  const isNever = rarity === "UR" && urStat?.wins === 0;
+                  const isHot = rarity === "UR" && urStat?.luck > 1.5;
+                  const isCold = rarity === "UR" && urStat?.luck < 0.5 && (urStat?.wins || 0) > 0;
+                  const rarityColor = ITEM_COLORS[(typeSortOrder(rarity) - 1 + ITEM_COLORS.length) % ITEM_COLORS.length] || C.gray;
                   return (
-                    <div key={i} style={{display:"flex",gap:"10px",padding:"10px",borderRadius:"8px",background:isNever?`${C.green}08`:C.surfaceAlt,border:`1px solid ${isNever?C.green+"30":C.border}`}}>
+                    <div key={it.reward_item_id || i} style={{display:"flex",gap:"10px",padding:"10px",borderRadius:"8px",background:isNever?`${C.green}08`:C.surfaceAlt,border:`1px solid ${isNever?C.green+"30":C.border}`}}>
                       {it.image_url && <img src={it.image_url} style={{width:"48px",height:"48px",objectFit:"contain",borderRadius:"6px",background:C.bg,flexShrink:0}} />}
                       <div style={{flex:1,minWidth:0}}>
-                        <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline"}}>
-                          <div style={{fontSize:"11px",fontWeight:600,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",flex:1}}>{(it.reward_item_name||"").replace(/^[^｜]*｜/,"")}</div>
-                          {it.recovery_price > 0 && <span style={{fontSize:"10px",color:C.gold,fontFamily:mono,flexShrink:0,marginLeft:"6px"}}>₩{Math.round(it.recovery_price).toLocaleString()}</span>}
+                        <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",gap:"8px"}}>
+                          <div style={{fontSize:"11px",fontWeight:600,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",flex:1}}>{cleanItemName(it.reward_item_name, 80)}</div>
+                          <span style={{...S.badge,background:`${rarityColor}20`,color:rarityColor}}>{rarity}</span>
                         </div>
-                        <div style={{fontSize:"10px",color:C.dim,marginTop:"2px"}}>
-                          {it.wins} win{it.wins!==1?"s":""} · {it.actualPct.toFixed(1)}%
-                          <span style={{marginLeft:"6px",color:isNever?C.green:isHot?C.orange:isCold?C.cyan:C.muted}}>
-                            {isNever?"● Never won":isHot?"● Hot":isCold?"● Cold":""}
-                          </span>
+                        <div style={{display:"flex",gap:"10px",flexWrap:"wrap",fontSize:"10px",color:C.dim,marginTop:"3px"}}>
+                          {Number.isFinite(Number(it.recovery_price)) && <span style={{color:C.gold,fontFamily:mono}}>{formatCurrency(it.recovery_price)}</span>}
+                          {Number.isFinite(Number(it.section_rate)) && <span>{formatPercent(it.section_rate, 2)} section</span>}
+                          {rarity === "UR" && urStat && <span>{urStat.wins} win{urStat.wins !== 1 ? "s" : ""} · {urStat.actualPct.toFixed(1)}%</span>}
                         </div>
-                        {/* mini bar */}
-                        <div style={{height:"3px",borderRadius:"2px",background:C.bg,marginTop:"4px",overflow:"hidden"}}>
-                          <div style={{height:"100%",borderRadius:"2px",width:`${Math.min(it.actualPct/Math.max(...e.itemStats.map(x=>x.actualPct||1))*100,100)}%`,background:isNever?C.green:ITEM_COLORS[i%ITEM_COLORS.length]}} />
-                        </div>
+                        {rarity === "UR" && urStat && (
+                          <div style={{fontSize:"10px",marginTop:"4px",color:isNever?C.green:isHot?C.orange:isCold?C.cyan:C.muted}}>
+                            {isNever?"● Never won":isHot?"● Hot":isCold?"● Cold":"● Normal"}
+                          </div>
+                        )}
                       </div>
                     </div>
                   );
@@ -1649,7 +2067,7 @@ const loadData = useCallback(async () => {
           <div>
             <h1 style={{fontSize:"22px",fontWeight:700,color:C.gold,margin:0,letterSpacing:"-0.5px"}}>KUJIMAN TRACKER</h1>
             <div style={{fontSize:"12px",color:C.dim,marginTop:"2px"}}>
-              {eventData.length} events · {records.length} UR records · {items.length} UR items tracked
+              {eventData.length} events · {records.length} UR records · {items.length} items tracked
               {lastRefresh && <span style={{marginLeft:"12px",color:C.muted}}>Updated {lastRefresh.toLocaleTimeString()}</span>}
             </div>
           </div>
@@ -1658,12 +2076,11 @@ const loadData = useCallback(async () => {
               style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:"6px",padding:"8px 12px",color:C.text,fontSize:"13px",fontFamily:font,outline:"none",width:"180px"}} />
             <select value={sortBy} onChange={ev=>setSortBy(ev.target.value)}
               style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:"6px",padding:"8px 12px",color:C.text,fontSize:"12px",fontFamily:font,outline:"none",cursor:"pointer"}}>
-              <option value="urgency">Sort: Urgency</option>
-              <option value="cumProb">Sort: Drought Severity</option>
-              <option value="records">Sort: Data Volume</option>
-              <option value="gap">Sort: Current Gap</option>
               <option value="poolDesc">Sort: Pool Number Descending</option>
+              <option value="pressure">Sort: Pressure</option>
+              <option value="records">Sort: Data Volume</option>
               <option value="name">Sort: Name</option>
+              <option value="gap">Sort: Current Gap</option>
             </select>
             <button onClick={loadData} style={{...baseBtn,background:C.surfaceAlt,color:C.dim,padding:"8px 16px",border:`1px solid ${C.border}`}}>DB Refresh</button>
             <button onClick={liveFetch} disabled={liveLoading} style={{...baseBtn,background:liveLoading?C.surfaceAlt:C.gold,color:liveLoading?C.dim:"#000",padding:"8px 16px"}}>{liveLoading ? "Fetching..." : "⚡ Live"}</button>
