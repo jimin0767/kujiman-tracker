@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Area, AreaChart, ComposedChart, Line, ReferenceLine, Cell, PieChart, Pie } from "recharts";
 
 /* ═══ CONFIG ═══ */
@@ -241,17 +241,30 @@ async function mapWithConcurrency(items, limit, worker) {
 }
 
 /* ═══ FONTS + PALETTE ═══ */
-const fl = document.createElement("link");
-fl.href = "https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap";
-fl.rel = "stylesheet";
-if (!document.head.querySelector('link[href*="DM+Sans"]')) document.head.appendChild(fl);
-
-// Inject pulse animation
-if (!document.getElementById('kujiman-anims')) {
-  const style = document.createElement('style');
-  style.id = 'kujiman-anims';
-  style.textContent = `@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}@keyframes goldGlow{0%,100%{box-shadow:0 0 20px rgba(232,185,49,0.12)}50%{box-shadow:0 0 35px rgba(232,185,49,0.22)}}`;
-  document.head.appendChild(style);
+/*
+ * FONT & ANIMATION SETUP
+ * For production, move these to your index.html <head>:
+ *   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+ *   <style>
+ *     @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+ *     @keyframes goldGlow{0%,100%{box-shadow:0 0 20px rgba(232,185,49,0.12)}50%{box-shadow:0 0 35px rgba(232,185,49,0.22)}}
+ *   </style>
+ *
+ * The code below is a runtime fallback that only runs once.
+ */
+if (typeof document !== "undefined") {
+  if (!document.head.querySelector('link[href*="DM+Sans"]')) {
+    const fl = document.createElement("link");
+    fl.href = "https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap";
+    fl.rel = "stylesheet";
+    document.head.appendChild(fl);
+  }
+  if (!document.getElementById('kujiman-anims')) {
+    const style = document.createElement('style');
+    style.id = 'kujiman-anims';
+    style.textContent = `@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}@keyframes goldGlow{0%,100%{box-shadow:0 0 20px rgba(232,185,49,0.12)}50%{box-shadow:0 0 35px rgba(232,185,49,0.22)}}`;
+    document.head.appendChild(style);
+  }
 }
 
 const C = {
@@ -265,9 +278,26 @@ const font = "'DM Sans',sans-serif";
 const mono = "'IBM Plex Mono',monospace";
 const baseBtn = { border:"none",borderRadius:"6px",fontFamily:font,cursor:"pointer",fontWeight:500,fontSize:"12px",transition:"all 0.15s" };
 
+/* ═══ SHARED STYLE MAP ═══ */
+const S = {
+  card: { background:C.surface, border:`1px solid ${C.border}`, borderRadius:"10px", padding:"16px", marginBottom:"16px" },
+  statBox: { background:C.surfaceAlt, borderRadius:"8px", padding:"12px", border:`1px solid ${C.border}` },
+  sectionTitle: { fontSize:"12px", fontWeight:600, color:C.dim, textTransform:"uppercase", letterSpacing:"1px", marginBottom:"10px" },
+  label: { fontSize:"10px", color:C.muted, textTransform:"uppercase", letterSpacing:"0.8px", marginBottom:"3px" },
+  monoValue: { fontFamily:mono, fontSize:"18px", fontWeight:700 },
+  badge: { padding:"3px 8px", borderRadius:"12px", fontSize:"9px", fontWeight:700, letterSpacing:"0.5px", whiteSpace:"nowrap" },
+  legendDot: { width:"8px", height:"8px", borderRadius:"999px", display:"inline-block" },
+  legendRow: { display:"flex", gap:"14px", flexWrap:"wrap", marginTop:"8px", fontSize:"10px", color:C.muted },
+  tabBtn: (active, color = C.gold) => ({ ...baseBtn, padding:"8px 16px", borderRadius:"6px 6px 0 0",
+    background: active ? C.surfaceAlt : C.bg, color: active ? color : C.dim,
+    borderBottom: active ? `2px solid ${color}` : "2px solid transparent" }),
+  alertBanner: (color) => ({ padding:"10px 14px", borderRadius:"8px", background:`${color}10`, border:`1px solid ${color}25` }),
+  tooltipBox: { background:C.surfaceAlt, border:`1px solid ${C.border}`, borderRadius:"8px", padding:"8px 12px", fontSize:"11px" },
+};
+
 const CTip = ({active,payload,label}) => {
   if (!active||!payload?.length) return null;
-  return (<div style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:"8px",padding:"8px 12px",fontSize:"11px"}}>
+  return (<div style={S.tooltipBox}>
     <div style={{color:C.dim,marginBottom:"3px"}}>{label}</div>
     {payload.map((p,i)=>(<div key={i} style={{color:p.color||C.text,fontFamily:mono,fontWeight:600}}>{p.name}: {typeof p.value==="number"?p.value.toLocaleString():p.value}</div>))}
   </div>);
@@ -284,6 +314,13 @@ export default function Dashboard() {
   const [selectedPool, setSelectedPool] = useState(null);
   const [sortBy, setSortBy] = useState("urgency");
   const [filter, setFilter] = useState("");
+  const [filterInput, setFilterInput] = useState("");
+  const filterTimer = useRef(null);
+  const onFilterChange = useCallback((val) => {
+    setFilterInput(val);
+    clearTimeout(filterTimer.current);
+    filterTimer.current = setTimeout(() => setFilter(val), 200);
+  }, []);
   const [lastRefresh, setLastRefresh] = useState(null);
   const [detailTab, setDetailTab] = useState("overview");
   const [favorites, setFavorites] = useState(() => {
@@ -518,21 +555,15 @@ const loadData = useCallback(async () => {
         );
 
         const existingIds = new Set(records.map(r => r.id));
-        newRecs = rows.filter(r => !existingIds.has(r.id)).length;
-      }
+        const newRows = rows.filter(r => !existingIds.has(r.id));
+        newRecs = newRows.length;
 
-      // 3. Reload records if new
-      if (newRecs > 0) {
-        let allR = [], offset = 0;
-        const PAGE = 1000;
-        while (true) {
-          const page = await sbFetch("win_records",
-            `select=id,reward_pool_id,num_sort,create_time,nickname,reward_item_name,reward_item_id,reward_item_type&reward_item_type=eq.UR&order=reward_pool_id,num_sort.asc&limit=${PAGE}&offset=${offset}`);
-          allR = allR.concat(page || []);
-          if (!page || page.length < PAGE) break;
-          offset += PAGE;
+        // Merge new rows directly instead of re-fetching everything
+        if (newRecs > 0) {
+          const merged = [...records, ...newRows]
+            .sort((a, b) => (a.reward_pool_id - b.reward_pool_id) || (a.num_sort - b.num_sort));
+          setRecords(merged);
         }
-        setRecords(allR);
       }
 
       const maxInfo = mData?.max_num_sort ? ` · Max: #${mData.max_num_sort.toLocaleString()}` : "";
@@ -641,7 +672,7 @@ const loadData = useCallback(async () => {
       )?.pressure || 0;
       const burstPressure = primaryPressure;
       const burstLevel = allInDebt ? "convergence" : burstPressure >= 100 ? "critical" : burstPressure >= 80 ? "high" : burstPressure >= 50 ? "medium" : "low";
-      const strategyHint = burstLevel === "convergence" ? "TOTAL CONVERGENCE (Enter Now)" : burstLevel === "critical" ? "TARGET ACQUIRED (Enter Now)" : burstLevel === "high" ? "High Pressure Zone (Prepare)" : "Accumulating Energy (Wait)";
+      const strategyHint = burstLevel === "convergence" ? "All timeframes overdue — strongest observed signal" : burstLevel === "critical" ? "Primary timeframe overdue — strong statistical signal" : burstLevel === "high" ? "Elevated pressure — approaching favorable range" : "Below threshold — insufficient signal";
 
       // Drought Streak: consecutive gaps > statedGap from the end
       let droughtStreak = 0;
@@ -918,9 +949,7 @@ const loadData = useCallback(async () => {
         {/* Tabs */}
         <div style={{padding:"12px 28px 0",display:"flex",gap:"4px",borderBottom:`1px solid ${C.border}`,maxWidth:"1200px",margin:"0 auto"}}>
           {tabs.map(t => (
-            <button key={t.id} onClick={()=>setDetailTab(t.id)} style={{...baseBtn,padding:"8px 16px",borderRadius:"6px 6px 0 0",
-              background:detailTab===t.id?C.surfaceAlt:C.bg, color:detailTab===t.id?C.gold:C.dim,
-              borderBottom:detailTab===t.id?`2px solid ${C.gold}`:"2px solid transparent"}}>{t.label}</button>
+            <button key={t.id} onClick={()=>setDetailTab(t.id)} style={S.tabBtn(detailTab===t.id)}>{t.label}</button>
           ))}
         </div>
 
@@ -942,7 +971,7 @@ const loadData = useCallback(async () => {
                 <div key={i} style={{background:C.surfaceAlt,borderRadius:"8px",padding:"12px",
                   border:`1px solid ${s.glow?s.c+"40":C.border}`,
                   boxShadow:s.glow?`0 0 12px ${s.c}15`:"none"}}>
-                  <div style={{fontSize:"10px",color:C.muted,textTransform:"uppercase",letterSpacing:"0.8px",marginBottom:"3px"}}>{s.l}</div>
+                  <div style={{...S.label}}>{s.l}</div>
                   <div style={{fontSize:"18px",fontWeight:700,fontFamily:s.l==="Drought Streak"?undefined:mono,color:s.c,
                     ...(s.glow?{textShadow:`0 0 10px ${s.c}40`}:{})}}>{s.v}</div>
                 </div>
@@ -950,7 +979,7 @@ const loadData = useCallback(async () => {
             </div>
 
             {/* Progress */}
-            <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:"10px",padding:"16px",marginBottom:"16px"}}>
+            <div style={S.card}>
               <div style={{display:"flex",justifyContent:"space-between",fontSize:"12px",marginBottom:"6px"}}>
                 <span style={{fontFamily:mono,color:C.gold,fontWeight:600}}>{e.currentGap.toLocaleString()} draws since last win</span>
                 <span style={{color:C.dim}}>#{e.maxNum.toLocaleString()} current · #{e.lastWin.toLocaleString()} last win</span>
@@ -982,7 +1011,7 @@ const loadData = useCallback(async () => {
                         {"🔥".repeat(Math.min(e.droughtStreak, 5))} DROUGHT STREAK x{e.droughtStreak}
                       </div>
                       <div style={{fontSize:"10px",color:C.dim,marginTop:"2px"}}>
-                        {e.droughtStreak >= 3 ? "3+ consecutive over-expected gaps — system heavily overdue" : e.droughtStreak >= 2 ? "2 consecutive droughts — pressure building" : "Current gap exceeds expected"}
+                        {e.droughtStreak >= 3 ? "3+ consecutive gaps above expected — elevated statistical pressure" : e.droughtStreak >= 2 ? "2 consecutive droughts — pressure building" : "Current gap exceeds expected"}
                       </div>
                     </div>
                     {e.springLoaded && (
@@ -997,7 +1026,7 @@ const loadData = useCallback(async () => {
 
                 {/* Multi-Gauge */}
                 <div style={{fontSize:"12px",fontWeight:600,color:e.allInDebt?C.gold:C.dim,textTransform:"uppercase",letterSpacing:"1px",marginBottom:"10px"}}>
-                  {e.allInDebt ? "⚡ TOTAL CONVERGENCE — All timeframes in debt" : "Pressure multi-gauge"}
+                  {e.allInDebt ? "⚡ All timeframes overdue — full convergence detected" : "Pressure multi-gauge"}
                   <span style={{fontSize:"10px",color:C.muted,textTransform:"none",fontWeight:400,marginLeft:"8px"}}>
                     (incl. current gap {e.currentGap.toLocaleString()} · scale 0–{Math.round(e.pressureGaugeMax).toLocaleString()}%)
                   </span>
@@ -1052,8 +1081,9 @@ const loadData = useCallback(async () => {
                     color:e.allInDebt?C.gold:e.burstLevel==="critical"?C.red:e.burstLevel==="high"?C.orange:C.muted,
                     ...(e.allInDebt?{textShadow:`0 0 10px ${C.gold}30`}:{})}}>
                     {e.allInDebt?"✨ ":e.burstLevel==="critical"?"🔥 ":e.burstLevel==="high"?"⚡ ":"⏳ "}
-                    STRATEGY: {e.strategyHint}
+                    SIGNAL: {e.strategyHint}
                   </div>
+                  <div style={{fontSize:"9px",color:C.muted,marginTop:"4px"}}>Based on observed gap patterns. Each draw remains independent.</div>
                 </div>
               </div>
             )}
@@ -1073,8 +1103,8 @@ const loadData = useCallback(async () => {
             </div>
 
             {/* CI */}
-            <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:"10px",padding:"16px",marginBottom:"16px"}}>
-              <div style={{fontSize:"12px",fontWeight:600,color:C.dim,textTransform:"uppercase",letterSpacing:"1px",marginBottom:"12px"}}>Confidence intervals</div>
+            <div style={S.card}>
+              <div style={{...S.sectionTitle, marginBottom:"12px"}}>Confidence intervals</div>
               {e.ci.map((c,i)=>{
                 const maxD = e.ci[e.ci.length-1].drawNumber * 1.05;
                 const curPct = (e.maxNum - e.lastWin) / (maxD - e.lastWin) * 100;
@@ -1094,8 +1124,8 @@ const loadData = useCallback(async () => {
 
             {/* Charts */}
             {e.gaps.length>0 && (
-              <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:"10px",padding:"16px",marginBottom:"16px"}}>
-                <div style={{fontSize:"12px",fontWeight:600,color:C.dim,textTransform:"uppercase",letterSpacing:"1px",marginBottom:"10px"}}>Gap trend</div>
+              <div style={S.card}>
+                <div style={{...S.sectionTitle}}>Gap trend</div>
                 <ResponsiveContainer width="100%" height={220}>
                   <ComposedChart data={gapTrend} margin={{top:5,right:5,bottom:5,left:0}}>
                     <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
@@ -1131,7 +1161,7 @@ const loadData = useCallback(async () => {
             {/* Sweet Spot Radar */}
             {e.gapHistogram.length > 1 && (
               <div style={{background:C.surface,border:`1px solid ${C.gold}20`,borderRadius:"10px",padding:"16px",marginBottom:"16px"}}>
-                <div style={{fontSize:"12px",fontWeight:600,color:C.dim,textTransform:"uppercase",letterSpacing:"1px",marginBottom:"4px"}}>
+                <div style={{...S.sectionTitle, marginBottom:"4px"}}>
                   Sweet spot radar — win distribution
                 </div>
                 <div style={{fontSize:"10px",color:C.muted,marginBottom:"10px"}}>
@@ -1279,8 +1309,8 @@ const loadData = useCallback(async () => {
             )}
 
             {/* Rate Monitor */}
-            <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:"10px",padding:"16px"}}>
-              <div style={{fontSize:"12px",fontWeight:600,color:C.dim,textTransform:"uppercase",letterSpacing:"1px",marginBottom:"12px"}}>Rate monitor</div>
+            <div style={{...S.card, marginBottom:0}}>
+              <div style={{...S.sectionTitle, marginBottom:"12px"}}>Rate monitor</div>
 
               {/* Rate comparison boxes */}
               {(() => {
@@ -1360,7 +1390,7 @@ const loadData = useCallback(async () => {
                           <YAxis tick={{fill:C.muted,fontSize:9}} unit="%" />
                           <Tooltip content={({active,payload,label})=>{
                             if(!active||!payload?.length)return null;
-                            return(<div style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:"8px",padding:"8px 12px",fontSize:"11px"}}>
+                            return(<div style={S.tooltipBox}>
                               <div style={{color:C.dim}}>{label}</div>
                               <div style={{color:C.purple,fontFamily:mono}}>Rate: {payload[0]?.value?.toFixed(3)}%</div>
                               <div style={{color:C.blue,fontFamily:mono}}>Stated: {(statedRate*100).toFixed(2)}%</div>
@@ -1375,7 +1405,7 @@ const loadData = useCallback(async () => {
 
                   {/* Trend */}
                   <div style={{display:"grid",gridTemplateColumns:"1fr",gap:"10px",marginBottom:"12px"}}>
-                    <div style={{background:C.surfaceAlt,borderRadius:"8px",padding:"12px",border:`1px solid ${C.border}`}}>
+                    <div style={S.statBox}>
                       <div style={{fontSize:"10px",color:C.muted}}>RECENT TREND</div>
                       <div style={{fontSize:"14px",fontWeight:700,color:Math.abs(trendDirection)<10?C.dim:trendDirection>0?C.red:C.green}}>
                         {e.gaps.length < 15 ? "Need more data" : trendDirection > 10 ? "↗ Gaps widening" : trendDirection < -10 ? "↘ Gaps shrinking" : "→ Stable"}
@@ -1426,7 +1456,7 @@ const loadData = useCallback(async () => {
               {e.recoveryBias.ready ? (
                 <>
                   <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:"10px",marginBottom:"12px"}}>
-                    <div style={{background:C.surfaceAlt,borderRadius:"8px",padding:"12px",border:`1px solid ${C.border}`}}>
+                    <div style={S.statBox}>
                       <div style={{fontSize:"10px",color:C.muted,textTransform:"uppercase"}}>Pressure debt (last {e.recoveryBias.debtWindow})</div>
                       <div style={{fontFamily:mono,fontSize:"18px",fontWeight:700,color:e.recoveryBias.pressureDebt >= 0 ? C.orange : C.cyan}}>
                         {e.recoveryBias.pressureDebt >= 0 ? "+" : ""}{Math.round(e.recoveryBias.pressureDebt).toLocaleString()}
@@ -1436,7 +1466,7 @@ const loadData = useCallback(async () => {
                       </div>
                     </div>
 
-                    <div style={{background:C.surfaceAlt,borderRadius:"8px",padding:"12px",border:`1px solid ${C.border}`}}>
+                    <div style={S.statBox}>
                       <div style={{fontSize:"10px",color:C.muted,textTransform:"uppercase"}}>Two-run balance</div>
                       <div style={{fontFamily:mono,fontSize:"18px",fontWeight:700,color:e.recoveryBias.previousOppositeRun ? (e.recoveryBias.combinedDeltaPct >= 0 ? C.green : C.red) : C.dim}}>
                         {e.recoveryBias.previousOppositeRun ? `${e.recoveryBias.combinedDeltaPct >= 0 ? "+" : ""}${e.recoveryBias.combinedDeltaPct.toFixed(1)}%` : "N/A"}
@@ -1448,7 +1478,7 @@ const loadData = useCallback(async () => {
                       </div>
                     </div>
 
-                    <div style={{background:C.surfaceAlt,borderRadius:"8px",padding:"12px",border:`1px solid ${C.border}`}}>
+                    <div style={S.statBox}>
                       <div style={{fontSize:"10px",color:C.muted,textTransform:"uppercase"}}>Current run state</div>
                       <div style={{fontSize:"18px",fontWeight:700,color:e.recoveryBias.currentRun?.type === "long" ? C.orange : e.recoveryBias.currentRun?.type === "short" ? C.cyan : C.dim}}>
                         {e.recoveryBias.currentRunLabel}
@@ -1486,8 +1516,8 @@ const loadData = useCallback(async () => {
           {detailTab === "items" && (<>
             {/* Item Win Frequency Chart */}
             {itemChartData.length > 0 && (
-              <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:"10px",padding:"16px",marginBottom:"16px"}}>
-                <div style={{fontSize:"12px",fontWeight:600,color:C.dim,textTransform:"uppercase",letterSpacing:"1px",marginBottom:"10px"}}>UR item win frequency</div>
+              <div style={S.card}>
+                <div style={{...S.sectionTitle}}>UR item win frequency</div>
                 <ResponsiveContainer width="100%" height={Math.max(200, itemChartData.length * 28 + 40)}>
                   <BarChart data={itemChartData} layout="vertical" margin={{top:5,right:30,bottom:5,left:10}}>
                     <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
@@ -1495,7 +1525,7 @@ const loadData = useCallback(async () => {
                     <YAxis type="category" dataKey="name" tick={{fill:C.dim,fontSize:10}} width={180} />
                     <Tooltip content={({active,payload})=>{
                       if(!active||!payload?.length)return null;const d=payload[0].payload;
-                      return(<div style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:"8px",padding:"8px 12px",fontSize:"11px"}}>
+                      return(<div style={S.tooltipBox}>
                         <div style={{color:C.text,fontWeight:600,marginBottom:"3px"}}>{d.fullName}</div>
                         <div style={{color:C.gold}}>{d.wins} wins</div>
                       </div>);
@@ -1537,8 +1567,8 @@ const loadData = useCallback(async () => {
             )}
 
             {/* Full Item List */}
-            <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:"10px",padding:"16px"}}>
-              <div style={{fontSize:"12px",fontWeight:600,color:C.dim,textTransform:"uppercase",letterSpacing:"1px",marginBottom:"10px"}}>All UR items ({e.poolItems.length})</div>
+            <div style={{...S.card, marginBottom:0}}>
+              <div style={{...S.sectionTitle}}>All UR items ({e.poolItems.length})</div>
               <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:"8px"}}>
                 {e.itemStats.map((it,i) => {
                   const isNever = it.wins === 0;
@@ -1572,8 +1602,8 @@ const loadData = useCallback(async () => {
 
           {/* ═══ HISTORY TAB ═══ */}
           {detailTab === "history" && (
-            <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:"10px",padding:"16px"}}>
-              <div style={{fontSize:"12px",fontWeight:600,color:C.dim,textTransform:"uppercase",letterSpacing:"1px",marginBottom:"10px"}}>UR win history ({e.recs.length})</div>
+            <div style={{...S.card, marginBottom:0}}>
+              <div style={{...S.sectionTitle}}>UR win history ({e.recs.length})</div>
               <div style={{display:"flex",flexDirection:"column",gap:"2px",maxHeight:"600px",overflowY:"auto"}}>
                 <div style={{display:"flex",padding:"6px 10px",fontSize:"10px",color:C.muted,borderBottom:`1px solid ${C.border}`}}>
                   <span style={{minWidth:"70px"}}>#</span>
@@ -1617,14 +1647,14 @@ const loadData = useCallback(async () => {
       <div style={{background:C.surface,borderBottom:`1px solid ${C.border}`,padding:"20px 28px"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:"12px"}}>
           <div>
-            <h1 style={{fontSize:"22px",fontWeight:700,color:C.gold,margin:0,letterSpacing:"-0.5px"}}>KUJIMAN PREDICTIONS</h1>
+            <h1 style={{fontSize:"22px",fontWeight:700,color:C.gold,margin:0,letterSpacing:"-0.5px"}}>KUJIMAN TRACKER</h1>
             <div style={{fontSize:"12px",color:C.dim,marginTop:"2px"}}>
               {eventData.length} events · {records.length} UR records · {items.length} UR items tracked
               {lastRefresh && <span style={{marginLeft:"12px",color:C.muted}}>Updated {lastRefresh.toLocaleTimeString()}</span>}
             </div>
           </div>
           <div style={{display:"flex",gap:"8px",alignItems:"center"}}>
-            <input placeholder="Search events..." value={filter} onChange={ev=>setFilter(ev.target.value)}
+            <input placeholder="Search events..." value={filterInput} onChange={ev=>onFilterChange(ev.target.value)}
               style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:"6px",padding:"8px 12px",color:C.text,fontSize:"13px",fontFamily:font,outline:"none",width:"180px"}} />
             <select value={sortBy} onChange={ev=>setSortBy(ev.target.value)}
               style={{background:C.surfaceAlt,border:`1px solid ${C.border}`,borderRadius:"6px",padding:"8px 12px",color:C.text,fontSize:"12px",fontFamily:font,outline:"none",cursor:"pointer"}}>
@@ -1653,12 +1683,8 @@ const loadData = useCallback(async () => {
 
       {/* Main View Tabs */}
       <div style={{padding:"0 28px",display:"flex",gap:"4px",maxWidth:"1200px",margin:"0 auto"}}>
-        <button onClick={()=>setMainView("events")} style={{...baseBtn,padding:"8px 16px",
-          background:mainView==="events"?C.surfaceAlt:C.bg,color:mainView==="events"?C.gold:C.dim,
-          borderBottom:mainView==="events"?`2px solid ${C.gold}`:"2px solid transparent"}}>All Events</button>
-        <button onClick={()=>setMainView("bot_radar")} style={{...baseBtn,padding:"8px 16px",
-          background:mainView==="bot_radar"?C.surfaceAlt:C.bg,color:mainView==="bot_radar"?C.pink:C.dim,
-          borderBottom:mainView==="bot_radar"?`2px solid ${C.pink}`:"2px solid transparent"}}>Suspicious User Tracker</button>
+        <button onClick={()=>setMainView("events")} style={S.tabBtn(mainView==="events", C.gold)}>All Events</button>
+        <button onClick={()=>setMainView("bot_radar")} style={S.tabBtn(mainView==="bot_radar", C.pink)}>Suspicious User Tracker</button>
       </div>
 
       <div style={{padding:"20px 28px",maxWidth:"1200px",margin:"0 auto"}}>
@@ -1673,7 +1699,7 @@ const loadData = useCallback(async () => {
                 These users consistently win with far fewer draws than normal — possible admin bots, or exceptionally lucky whales.
               </div>
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"10px",marginBottom:"16px"}}>
-                <div style={{background:C.surfaceAlt,borderRadius:"8px",padding:"12px",border:`1px solid ${C.border}`}}>
+                <div style={S.statBox}>
                   <div style={{fontSize:"10px",color:C.muted,textTransform:"uppercase"}}>Total users</div>
                   <div style={{fontFamily:mono,fontSize:"18px",fontWeight:700}}>{whaleData.users.length}</div>
                 </div>
@@ -1681,7 +1707,7 @@ const loadData = useCallback(async () => {
                   <div style={{fontSize:"10px",color:C.red,textTransform:"uppercase"}}>Flagged suspicious</div>
                   <div style={{fontFamily:mono,fontSize:"18px",fontWeight:700,color:C.red}}>{whaleData.users.filter(u=>u.isSuspicious).length}</div>
                 </div>
-                <div style={{background:C.surfaceAlt,borderRadius:"8px",padding:"12px",border:`1px solid ${C.border}`}}>
+                <div style={S.statBox}>
                   <div style={{fontSize:"10px",color:C.muted,textTransform:"uppercase"}}>Global avg gap</div>
                   <div style={{fontFamily:mono,fontSize:"18px",fontWeight:700}}>{whaleData.globalAvgGap.toLocaleString()}</div>
                 </div>
@@ -1689,7 +1715,7 @@ const loadData = useCallback(async () => {
             </div>
 
             {/* User Table */}
-            <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:"10px",padding:"16px"}}>
+            <div style={{...S.card, marginBottom:0}}>
               <div style={{display:"flex",padding:"8px 12px",fontSize:"10px",color:C.muted,borderBottom:`1px solid ${C.border}`,gap:"8px"}}>
                 <span style={{width:"24px"}}></span>
                 <span style={{flex:2}}>User</span>
@@ -1745,10 +1771,10 @@ const loadData = useCallback(async () => {
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
                     <div>
                       <span style={{fontSize:"12px",fontWeight:700,color:e.droughtStreak>=3?C.red:C.orange}}>
-                        {"🔥".repeat(Math.min(e.droughtStreak,5))} SYSTEM DEBT ALERT — {e.event_name}
+                        {"🔥".repeat(Math.min(e.droughtStreak,5))} EXTENDED DROUGHT — {e.event_name}
                       </span>
                       <div style={{fontSize:"10px",color:C.dim,marginTop:"2px"}}>
-                        Failed to drop within expected range for {e.droughtStreak} consecutive cycles. Burst probability is peaking.
+                        Gap has exceeded expected range for {e.droughtStreak} consecutive cycles. Statistical pressure is elevated.
                       </div>
                     </div>
                     <span style={{fontFamily:mono,fontSize:"13px",fontWeight:700,color:e.droughtStreak>=3?C.red:C.orange,whiteSpace:"nowrap",marginLeft:"12px"}}>
@@ -1845,31 +1871,43 @@ const loadData = useCallback(async () => {
                   </div>
                 )}
 
-                {/* Burst Multi-Gauge — Vertical Bars */}
-                <div style={{display:"grid",gridTemplateColumns:`repeat(${e.burstWindows.filter(w=>w.active||w.label!=="All").length}, minmax(0, 1fr))`,gap:"6px",marginBottom:"10px",padding:"8px",borderRadius:"6px",
-                  background:C.surfaceAlt,border:`1px solid ${e.allInDebt?C.gold+"40":C.border}`,
-                  boxShadow:e.allInDebt?`0 0 16px ${C.gold}18, inset 0 0 12px ${C.gold}06`:"none",alignItems:"stretch"}}>
-                  {e.burstWindows.filter(w => w.active || w.label !== "All").map((w,i) => {
-                    const wc = !w.active ? C.muted : w.pressure >= 100 ? C.red : w.pressure >= 80 ? C.orange : w.pressure >= 50 ? C.gold : C.dim;
-                    const pct = e.pressureGaugeMax > 0 ? Math.min(((w.pressure || 0) / e.pressureGaugeMax) * 100, 100) : 0;
-                    return (
-                      <div key={i} style={{display:"flex",flexDirection:"column",alignItems:"stretch",justifyContent:"space-between",gap:"4px",minWidth:0}}>
-                        <div style={{width:"100%",height:"38px",background:C.bg,borderRadius:"4px",overflow:"hidden",position:"relative",display:"flex",alignItems:"flex-end"}}>
-                          <div style={{width:"100%",height:`${pct}%`,borderRadius:"4px",transition:"height 0.4s ease",
-                            background:w.pressure>=100?`linear-gradient(0deg,${C.orange},${C.red})`:w.pressure>=80?`linear-gradient(0deg,${C.gold}60,${C.orange})`:w.pressure>=50?`linear-gradient(0deg,${C.green}40,${C.gold}60)`:C.muted+"40",
-                            boxShadow:w.pressure>=100?`0 0 6px ${C.red}30`:"none"}} />
-                          {w.pressure>=100 && <div style={{position:"absolute",left:"50%",top:0,width:"1px",height:"100%",background:`${C.red}30`}} />}
-                        </div>
-                        <div style={{fontSize:"9px",fontWeight:700,color:wc,fontFamily:mono,textAlign:"center",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",lineHeight:1.1}}>
-                          {w.active ? `${w.pressure.toFixed(1)}%` : "—"}
-                        </div>
-                        <div style={{fontSize:"7px",color:C.muted,textTransform:"uppercase",textAlign:"center",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",letterSpacing:"0.4px"}}>
-                          {w.label}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
+                {/* Pressure Multi-Gauge — Full Card View */}
+                {e.burstWindows.some(w => w.active) && (
+                  <div style={{marginBottom:"10px",padding:"8px 10px",borderRadius:"6px",
+                    background:e.allInDebt?`linear-gradient(135deg,${C.gold}06,${C.surfaceAlt})`:C.surfaceAlt,
+                    border:`1px solid ${e.allInDebt?C.gold+"40":e.burstLevel==="critical"?C.red+"30":C.border}`,
+                    boxShadow:e.allInDebt?`0 0 16px ${C.gold}18`:"none"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"6px"}}>
+                      <span style={{fontSize:"9px",color:e.allInDebt?C.gold:C.muted,textTransform:"uppercase",letterSpacing:"0.4px",fontWeight:600}}>
+                        {e.allInDebt?"⚡ Full Convergence":"Pressure Multi-Gauge"}
+                      </span>
+                      <span style={{fontSize:"8px",color:C.muted}}>0–{Math.round(e.pressureGaugeMax)}%</span>
+                    </div>
+                    <div style={{display:"flex",flexDirection:"column",gap:"3px"}}>
+                      {e.burstWindows.filter(w => w.active || w.label !== "All").map((w, i) => {
+                        const wColor = !w.active ? C.muted : w.pressure >= 100 ? C.red : w.pressure >= 80 ? C.orange : w.pressure >= 50 ? C.gold : C.dim;
+                        const gaugeWidth = e.pressureGaugeMax > 0 ? Math.min((w.pressure || 0) / e.pressureGaugeMax * 100, 100) : 0;
+                        return (
+                          <div key={i} style={{display:"flex",alignItems:"center",gap:"6px"}}>
+                            <span style={{fontSize:"9px",fontWeight:600,color:wColor,width:"28px",textAlign:"right",flexShrink:0}}>{w.label}</span>
+                            <div style={{flex:1,height:"6px",borderRadius:"3px",background:C.bg,overflow:"hidden",position:"relative"}}>
+                              {w.active ? (
+                                <div style={{height:"100%",borderRadius:"3px",width:`${gaugeWidth}%`,
+                                  background:w.pressure>=100?`linear-gradient(90deg,${C.orange},${C.red})`:w.pressure>=80?C.orange:w.pressure>=50?C.gold:`${C.muted}40`,
+                                  transition:"width 0.3s ease"}} />
+                              ) : (
+                                <div style={{height:"100%",borderRadius:"3px",width:"0%",background:`${C.muted}20`}} />
+                              )}
+                            </div>
+                            <span style={{fontSize:"9px",fontFamily:mono,fontWeight:600,color:wColor,width:"42px",textAlign:"right",flexShrink:0}}>
+                              {w.active ? `${w.pressure.toFixed(0)}%` : "—"}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
 
                 {/* Bottom stats */}
                 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px",marginBottom:"8px"}}>
