@@ -27,6 +27,136 @@ function normalizeType(value) {
   return value ? String(value).trim().toUpperCase() : "UNKNOWN";
 }
 
+function pickLeastUrItemsWithFloor(itemStats, minCount = 3) {
+  const sorted = [...itemStats]
+    .sort((a, b) =>
+      (a.wins - b.wins) ||
+      ((b.recovery_price || 0) - (a.recovery_price || 0)) ||
+      String(a.reward_item_name || "").localeCompare(String(b.reward_item_name || ""))
+    );
+
+  if (!sorted.length) return [];
+
+  const picked = [];
+  let tierWins = null;
+
+  for (const item of sorted) {
+    if (tierWins === null) tierWins = item.wins;
+
+    if (picked.length < minCount || item.wins === tierWins) {
+      picked.push(item);
+      tierWins = item.wins;
+      continue;
+    }
+
+    break;
+  }
+
+  return picked;
+}
+
+
+function BoxPlotStrip({ stats, currentGap }) {
+  const min = Number(stats?.min ?? 0);
+  const q1 = Number(stats?.q1 ?? 0);
+  const median = Number(stats?.median ?? 0);
+  const q3 = Number(stats?.q3 ?? 0);
+  const max = Number(stats?.max ?? 0);
+
+  const span = Math.max(max - min, 1);
+  const pct = (v) => ((v - min) / span) * 100;
+
+  return (
+    <div style={{ ...S.card, marginBottom: "16px" }}>
+      <div style={S.sectionTitle}>Gap distribution box plot</div>
+
+      <div style={{ position: "relative", height: "90px", marginTop: "10px" }}>
+        {/* whisker */}
+        <div
+          style={{
+            position: "absolute",
+            left: `${pct(min)}%`,
+            width: `${pct(max) - pct(min)}%`,
+            top: "42px",
+            height: "2px",
+            background: C.dim,
+          }}
+        />
+
+        {/* min / max ticks */}
+        {[min, max].map((v, idx) => (
+          <div
+            key={`tick-${idx}`}
+            style={{
+              position: "absolute",
+              left: `${pct(v)}%`,
+              top: "32px",
+              width: "2px",
+              height: "22px",
+              background: C.dim,
+            }}
+          />
+        ))}
+
+        {/* box */}
+        <div
+          style={{
+            position: "absolute",
+            left: `${pct(q1)}%`,
+            width: `${Math.max(pct(q3) - pct(q1), 1)}%`,
+            top: "24px",
+            height: "36px",
+            background: `${C.blue}18`,
+            border: `1px solid ${C.blue}50`,
+            borderRadius: "8px",
+          }}
+        />
+
+        {/* median */}
+        <div
+          style={{
+            position: "absolute",
+            left: `${pct(median)}%`,
+            top: "20px",
+            width: "3px",
+            height: "44px",
+            background: C.gold,
+            borderRadius: "2px",
+          }}
+        />
+
+        {/* current gap marker */}
+        {Number.isFinite(currentGap) && currentGap > 0 ? (
+          <div
+            style={{
+              position: "absolute",
+              left: `${pct(Math.max(min, Math.min(currentGap, max)))}%`,
+              top: "10px",
+              transform: "translateX(-50%)",
+              color: C.red,
+              fontSize: "11px",
+              fontWeight: 700,
+              textAlign: "center",
+            }}
+          >
+            ▼
+            <div style={{ marginTop: "2px" }}>Current</div>
+          </div>
+        ) : null}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: "8px", marginTop: "8px", fontSize: "11px", color: C.dim }}>
+        <div>Min {Math.round(min).toLocaleString()}</div>
+        <div>Q1 {Math.round(q1).toLocaleString()}</div>
+        <div>Median {Math.round(median).toLocaleString()}</div>
+        <div>Q3 {Math.round(q3).toLocaleString()}</div>
+        <div>Max {Math.round(max).toLocaleString()}</div>
+      </div>
+    </div>
+  );
+}
+
+
 function percentile(sorted, p) {
   if (!sorted.length) return 0;
   const idx = (sorted.length - 1) * p;
@@ -165,6 +295,7 @@ function buildGapRuns(series, expectedGap) {
   });
   return runs;
 }
+
 
 function computeRecoveryBias(gaps, currentGap, statedP) {
   const expectedGap = statedP > 0 ? 1 / statedP : 0;
@@ -816,8 +947,10 @@ const loadData = useCallback(async () => {
       }).sort((a,b) => b.wins - a.wins || ((Number(b.recovery_price) || 0) - (Number(a.recovery_price) || 0)));
 
       const neverWon = itemStats.filter(i => i.wins === 0);
-      const leastUrWins = itemStats.length ? Math.min(...itemStats.map(i => i.wins)) : 0;
-      const leastPickedUrItems = itemStats.filter(i => i.wins === leastUrWins);
+      const leastPickedUrItems = pickLeastUrItemsWithFloor(itemStats, 3);
+      const leastUrWins = leastPickedUrItems.length
+       ? Math.min(...leastPickedUrItems.map(i => i.wins))
+       : 0;
 
       const sectionRateMap = {};
       poolSections.forEach(sec => {
@@ -877,13 +1010,24 @@ const loadData = useCallback(async () => {
       const expectedValue = sum(sectionStats.map(stat => stat.evContribution));
       const expectedProfit = expectedValue - price;
       const expectedROI = price > 0 ? (expectedProfit / price) * 100 : 0;
-      const urSection = sectionStats.find(stat => stat.type === "UR") || null;
+      const urSection = sectionStats.find((s) => s.type === "UR");
+      const nonUrEv = sectionStats
+        .filter((s) => s.type !== "UR")
+        .reduce((sum, s) => sum + (s.evContribution || 0), 0);
+
+
+      
       const leastPickedUrAvgPrice = leastPickedUrItems.length
-        ? mean(leastPickedUrItems.map(it => Number(it.recovery_price)).filter(v => Number.isFinite(v)))
+        ? mean(
+            leastPickedUrItems
+              .map(it => Number(it.recovery_price))
+              .filter(v => Number.isFinite(v))
+          )
         : 0;
-      const leastPickedUrExpectedValue = urSection
-        ? expectedValue - urSection.evContribution + (((urSection.sectionRate || 0) / 100) * leastPickedUrAvgPrice)
-        : expectedValue;
+      
+      const leastPickedUrExpectedValue =
+        nonUrEv + (((urSection?.sectionRate || 0) / 100) * leastPickedUrAvgPrice);
+
       const leastPickedUrProfit = leastPickedUrExpectedValue - price;
       const leastPickedUrROI = price > 0 ? (leastPickedUrProfit / price) * 100 : 0;
 
@@ -1100,12 +1244,18 @@ const loadData = useCallback(async () => {
     }));
 
     // Item frequency chart data
-    const itemChartData = e.itemStats.filter(i => i.wins > 0).map((it, idx) => ({
-      name: cleanItemName(it.reward_item_name, 25),
-      fullName: cleanItemName(it.reward_item_name, 100),
-      wins: it.wins,
-      fill: ITEM_COLORS[idx % ITEM_COLORS.length],
-    }));
+    const itemChartData = e.itemStats
+      .filter(i => i.wins > 0)
+      .map((it, idx) => ({
+        name: cleanItemName(it.reward_item_name, 25),
+        fullName: cleanItemName(it.reward_item_name, 100),
+        wins: it.wins,
+        image_url: it.image_url || null,
+        recovery_price: Number(it.recovery_price) || 0,
+        actualPct: Number(it.actualPct?.toFixed?.(2) ?? 0),
+        expectedPct: Number(it.expectedPct?.toFixed?.(2) ?? 0),
+        fill: ITEM_COLORS[idx % ITEM_COLORS.length],
+      }));
     const visiblePredictions = e.predictions.filter(p => p.method !== "Bayesian");
 
     const tabs = [
@@ -1398,38 +1548,72 @@ const loadData = useCallback(async () => {
                     <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
                     <XAxis dataKey="range" tick={{fill:C.muted,fontSize:8}} angle={-30} textAnchor="end" height={55} interval={e.gapHistogram.length > 15 ? 1 : 0} />
                     <YAxis tick={{fill:C.muted,fontSize:9}} allowDecimals={false} />
-                    <Tooltip content={({ active, payload }) => {
-                      if (!active || !payload?.length) return null;
-                      const d = payload[0].payload;
+                    <Tooltip
+                      content={({ active, payload }) => {
+                        if (!active || !payload?.length) return null;
+                        const d = payload[0].payload;
+                    
+                        return (
+                          <div style={{ ...S.tooltipBox, minWidth: "220px" }}>
+                            <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+                              {d.image_url ? (
+                                <img
+                                  src={d.image_url}
+                                  alt={d.fullName}
+                                  style={{
+                                    width: "52px",
+                                    height: "52px",
+                                    objectFit: "cover",
+                                    borderRadius: "8px",
+                                    border: `1px solid ${C.border}`,
+                                    background: C.surface,
+                                  }}
+                                />
+                              ) : null}
 
-                      return (
-                        <div
-                          style={{
-                            background: C.surfaceAlt,
-                            border: `1px solid ${C.border}`,
-                            borderRadius: "8px",
-                            padding: "8px 12px",
-                            fontSize: "11px",
-                          }}
-                        >
-                          <div style={{ color: C.text, fontWeight: 600 }}>
-                            Gap {d.range}
+                              <div style={{ minWidth: 0 }}>
+                                <div style={{ fontWeight: 700, color: C.text, marginBottom: "3px" }}>
+                                  {d.fullName}
+                                </div>
+                                <div style={{ fontSize: "11px", color: C.dim }}>
+                                  {d.wins} wins
+                                </div>
+                                <div style={{ fontSize: "11px", color: C.dim }}>
+                                  {formatCurrency(d.recovery_price)}
+                                </div>
+                                <div style={{ fontSize: "11px", color: C.dim }}>
+                                  Actual {formatPercent(d.actualPct, 2)} · Expected {formatPercent(d.expectedPct, 2)}
+                                </div>
+                              </div>
+                            </div>
                           </div>
-
-                          <div style={{ color: d.fill, fontFamily: mono }}>
-                            This band: {d.count} wins ({d.pct.toFixed(1)}%)
-                          </div>
-
-                          <div style={{ color: C.gold, fontFamily: mono, marginTop: "2px" }}>
-                            Cumulative: {d.cumCount} wins ({d.cumPct.toFixed(1)}%)
-                          </div>
-
-                          <div style={{ color: C.dim, marginTop: "2px" }}>
-                            {(d.rangeMid / e.statedGap * 100).toFixed(0)}% of expected gap
+                        );
+                      }}
+                    />
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "10px", marginTop: "12px" }}>
+                      {itemChartData.map((d, i) => (
+                        <div key={`${d.fullName}-${i}`} style={{ ...S.statBox, display: "flex", gap: "10px", alignItems: "center" }}>
+                          {d.image_url ? (
+                            <img
+                              src={d.image_url}
+                              alt={d.fullName}
+                              style={{ width: "44px", height: "44px", objectFit: "cover", borderRadius: "8px", border: `1px solid ${C.border}` }}
+                            />
+                          ) : null}
+                          <div style={{ minWidth: 0 }}>
+                            <div style={{ fontSize: "12px", fontWeight: 700, color: C.text }}>
+                              {d.name}
+                            </div>
+                            <div style={{ fontSize: "11px", color: C.dim }}>
+                              {formatCurrency(d.recovery_price)}
+                            </div>
+                            <div style={{ fontSize: "11px", color: C.dim }}>
+                              {d.wins} wins
+                            </div>
                           </div>
                         </div>
-                      );
-                    }} />
+                      ))}
+                    </div>
                     <Bar dataKey="count" radius={[3,3,0,0]} name="Wins">
                       {e.gapHistogram.map((d,i)=>(
                         <Cell
@@ -1735,6 +1919,7 @@ const loadData = useCallback(async () => {
 
           {/* ═══ STATISTICS TAB ═══ */}
           {detailTab === "statistics" && (<>
+            <BoxPlotStrip stats={e.gapStats} currentGap={e.currentGap} />
             <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:"10px",marginBottom:"16px"}}>
               {[
                 { l:"Mean gap", v: Math.round(e.gapStats.mean).toLocaleString(), c:C.blue },
@@ -1829,23 +2014,44 @@ const loadData = useCallback(async () => {
               <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(170px,1fr))",gap:"10px",marginBottom:"14px"}}>
                 <div style={S.statBox}>
                   <div style={S.label}>Least-picked UR count</div>
-                  <div style={{...S.monoValue,color:C.cyan}}>{e.leastPickedUrItems.length.toLocaleString()}</div>
+                  <div style={{...S.monoValue,color:C.cyan}}>
+                    {e.leastPickedUrItems.length.toLocaleString()}
+                  </div>
                 </div>
+
                 <div style={S.statBox}>
                   <div style={S.label}>Least-picked UR wins</div>
-                  <div style={{...S.monoValue,color:C.cyan}}>{e.leastUrWins.toLocaleString()}</div>
+                  <div style={{...S.monoValue,color:C.cyan}}>
+                    {e.leastUrWins.toLocaleString()}
+                  </div>
                 </div>
+
                 <div style={S.statBox}>
                   <div style={S.label}>Least-picked UR avg price</div>
-                  <div style={{...S.monoValue,color:C.gold}}>{formatCurrency(e.leastPickedUrAvgPrice)}</div>
+                  <div style={{...S.monoValue,color:C.gold}}>
+                    {formatCurrency(e.leastPickedUrAvgPrice)}
+                  </div>
                 </div>
+
                 <div style={S.statBox}>
                   <div style={S.label}>Cold-UR EV / draw</div>
-                  <div style={{...S.monoValue,color:e.leastPickedUrExpectedValue >= e.price ? C.green : C.red}}>{formatCurrency(e.leastPickedUrExpectedValue)}</div>
+                  <div style={{...S.monoValue,color:e.leastPickedUrExpectedValue >= e.price ? C.green : C.red}}>
+                    {formatCurrency(e.leastPickedUrExpectedValue)}
+                  </div>
                 </div>
+
+                <div style={S.statBox}>
+                  <div style={S.label}>Cold-UR expected profit</div>
+                  <div style={{...S.monoValue,color:e.leastPickedUrProfit >= 0 ? C.green : C.red}}>
+                    {formatSignedCurrency(e.leastPickedUrProfit)}
+                  </div>
+                </div>
+              
                 <div style={S.statBox}>
                   <div style={S.label}>Cold-UR ROI</div>
-                  <div style={{...S.monoValue,color:e.leastPickedUrROI >= 0 ? C.green : C.red}}>{formatPercent(e.leastPickedUrROI, 1)}</div>
+                  <div style={{...S.monoValue,color:e.leastPickedUrROI >= 0 ? C.green : C.red}}>
+                    {formatPercent(e.leastPickedUrROI, 1)}
+                  </div>
                 </div>
               </div>
 
@@ -1866,92 +2072,49 @@ const loadData = useCallback(async () => {
                 <div style={{fontSize:"11px",color:C.dim}}>No UR item frequency history yet for this event.</div>
               )}
             </div>
-
-            <div style={S.card}>
-              <div style={S.sectionTitle}>Useful EDA</div>
-              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(170px,1fr))",gap:"10px",marginBottom:"14px"}}>
-                <div style={S.statBox}>
-                  <div style={S.label}>UR items</div>
-                  <div style={{...S.monoValue,color:C.text}}>{e.urPoolItems.length.toLocaleString()}</div>
-                </div>
-                <div style={S.statBox}>
-                  <div style={S.label}>Equal-share UR pct</div>
-                  <div style={{...S.monoValue,color:C.purple}}>{formatPercent(e.urExpectedSharePct, 1)}</div>
-                </div>
-                <div style={S.statBox}>
-                  <div style={S.label}>UR price mean</div>
-                  <div style={{...S.monoValue,color:C.gold}}>{formatCurrency(e.urItemPriceStats.mean)}</div>
-                </div>
-                <div style={S.statBox}>
-                  <div style={S.label}>UR price std dev</div>
-                  <div style={{...S.monoValue,color:C.orange}}>{formatCurrency(e.urItemPriceStats.stdDev)}</div>
-                </div>
-                <div style={S.statBox}>
-                  <div style={S.label}>UR win concentration</div>
-                  <div style={{...S.monoValue,color:C.cyan}}>{e.urWinConcentration.toFixed(3)}</div>
-                </div>
-              </div>
-
-              {e.itemStats.length > 0 ? (
-                <ResponsiveContainer width="100%" height={Math.max(240, e.itemStats.length * 24 + 60)}>
-                  <BarChart data={e.itemStats.map((item, idx) => ({
-                    name: cleanItemName(item.reward_item_name, 24),
-                    fullName: cleanItemName(item.reward_item_name, 100),
-                    wins: item.wins,
-                    actualPct: Number(item.actualPct.toFixed(2)),
-                    expectedPct: Number(item.expectedPct.toFixed(2)),
-                    fill: ITEM_COLORS[idx % ITEM_COLORS.length],
-                  }))} layout="vertical" margin={{ top: 5, right: 30, left: 10, bottom: 5 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
-                    <XAxis type="number" tick={{ fill:C.muted, fontSize:10 }} />
-                    <YAxis type="category" dataKey="name" tick={{ fill:C.dim, fontSize:10 }} width={170} />
-                    <Tooltip content={({active,payload}) => {
-                      if (!active || !payload?.length) return null;
-                      const d = payload[0].payload;
-                      return (<div style={S.tooltipBox}>
-                        <div style={{color:C.text,fontWeight:700,marginBottom:"4px"}}>{d.fullName}</div>
-                        <div style={{color:C.gold}}>Wins: {d.wins}</div>
-                        <div style={{color:C.dim}}>Actual share: {formatPercent(d.actualPct, 2)}</div>
-                        <div style={{color:C.dim}}>Equal-share baseline: {formatPercent(d.expectedPct, 2)}</div>
-                      </div>);
-                    }} />
-                    <Bar dataKey="actualPct" name="Actual share %" radius={[0,4,4,0]}>
-                      {e.itemStats.map((item, idx) => <Cell key={item.reward_item_id || idx} fill={ITEM_COLORS[idx % ITEM_COLORS.length]} />)}
-                    </Bar>
-                    <ReferenceLine x={e.urExpectedSharePct} stroke={C.gold} strokeDasharray="4 4" />
-                  </BarChart>
-                </ResponsiveContainer>
-              ) : (
-                <div style={{fontSize:"11px",color:C.dim}}>Need at least one UR record before the UR item balance chart becomes meaningful.</div>
-              )}
-            </div>
           </>)}
 
           {/* ═══ ITEMS TAB ═══ */}
           {detailTab === "items" && (<>
             {/* Item Win Frequency Chart */}
-            {itemChartData.length > 0 && (
-              <div style={S.card}>
-                <div style={{...S.sectionTitle}}>UR item win frequency</div>
-                <ResponsiveContainer width="100%" height={Math.max(200, itemChartData.length * 28 + 40)}>
-                  <BarChart data={itemChartData} layout="vertical" margin={{top:5,right:30,bottom:5,left:10}}>
-                    <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
-                    <XAxis type="number" tick={{fill:C.muted,fontSize:10}} allowDecimals={false} />
-                    <YAxis type="category" dataKey="name" tick={{fill:C.dim,fontSize:10}} width={180} />
-                    <Tooltip content={({active,payload})=>{
-                      if(!active||!payload?.length)return null;const d=payload[0].payload;
-                      return(<div style={S.tooltipBox}>
-                        <div style={{color:C.text,fontWeight:600,marginBottom:"3px"}}>{d.fullName}</div>
-                        <div style={{color:C.gold}}>{d.wins} wins</div>
-                      </div>);
-                    }} />
-                    <Bar dataKey="wins" radius={[0,3,3,0]}>
-                      {itemChartData.map((d,i)=><Cell key={i} fill={d.fill} />)}
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-            )}
+            {itemChartData.length > 0 && (() => {
+              const maxWins = Math.max(...itemChartData.map(d => d.wins), 1);
+              return (
+                <div style={S.card}>
+                  <div style={{...S.sectionTitle}}>UR item win frequency</div>
+                  <div style={{display:"flex",flexDirection:"column",gap:"6px",marginTop:"8px"}}>
+                    {itemChartData.map((d, i) => (
+                      <div key={i} style={{display:"flex",alignItems:"center",gap:"10px",padding:"6px 8px",borderRadius:"8px",background:C.surfaceAlt,border:`1px solid ${C.border}`}}>
+                        {/* Item image */}
+                        {d.image_url ? (
+                          <img src={d.image_url} alt={d.fullName} style={{width:"40px",height:"40px",objectFit:"contain",borderRadius:"6px",background:C.bg,flexShrink:0}} />
+                        ) : (
+                          <div style={{width:"40px",height:"40px",borderRadius:"6px",background:C.bg,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"10px",color:C.muted}}>?</div>
+                        )}
+
+                        {/* Name + price column */}
+                        <div style={{width:"160px",flexShrink:0,minWidth:0}}>
+                          <div style={{fontSize:"11px",fontWeight:600,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={d.fullName}>{d.name}</div>
+                          {d.recovery_price > 0 && (
+                            <div style={{fontSize:"10px",color:C.gold,fontFamily:mono,marginTop:"1px"}}>₩{Math.round(d.recovery_price).toLocaleString()}</div>
+                          )}
+                        </div>
+
+                        {/* Bar + win count */}
+                        <div style={{flex:1,display:"flex",alignItems:"center",gap:"8px"}}>
+                          <div style={{flex:1,height:"14px",borderRadius:"4px",background:C.bg,overflow:"hidden"}}>
+                            <div style={{height:"100%",borderRadius:"4px",width:`${(d.wins / maxWins) * 100}%`,background:d.fill,transition:"width 0.3s ease"}} />
+                          </div>
+                          <div style={{fontSize:"11px",fontFamily:mono,fontWeight:600,color:d.fill,minWidth:"50px",textAlign:"right"}}>
+                            {d.wins} <span style={{fontSize:"9px",color:C.dim,fontWeight:400}}>({d.actualPct}%)</span>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
 
             {/* Item Prediction */}
             {e.poolItems.length > 0 && e.recs.length > 0 && (
