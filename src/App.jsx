@@ -207,6 +207,11 @@ function formatPercent(value, digits = 1) {
   return `${(Number(value) || 0).toFixed(digits)}%`;
 }
 
+function formatDrawGap(value) {
+  const draws = Math.max(0, Number(value) || 0);
+  return `${draws.toLocaleString()} draw${draws === 1 ? "" : "s"}`;
+}
+
 function cleanItemName(name, max = 60) {
   return (name || "Unknown").replace(/^[^｜]*｜/, "").slice(0, max);
 }
@@ -935,7 +940,16 @@ const loadData = useCallback(async () => {
       const poolSections = sectionsByPool[pid] || [];
       const urPoolItems = poolItems.filter(it => normalizeType(it.reward_item_type) === "UR");
       const itemWinCounts = {};
-      recs.forEach(r => { if (r.reward_item_id) itemWinCounts[r.reward_item_id] = (itemWinCounts[r.reward_item_id] || 0) + 1; });
+      const itemLastWinNum = {};
+      const itemLastWinIndex = {};
+      const recsByNum = [...recs].sort((a,b) => (Number(a.num_sort) || 0) - (Number(b.num_sort) || 0));
+      recsByNum.forEach((r, idx) => {
+        if (!r.reward_item_id) return;
+        itemWinCounts[r.reward_item_id] = (itemWinCounts[r.reward_item_id] || 0) + 1;
+        const drawNum = Number(r.num_sort) || 0;
+        itemLastWinNum[r.reward_item_id] = Math.max(itemLastWinNum[r.reward_item_id] || 0, drawNum);
+        itemLastWinIndex[r.reward_item_id] = idx;
+      });
 
       const itemStats = urPoolItems.map(it => {
         const wins = itemWinCounts[it.reward_item_id] || 0;
@@ -943,7 +957,11 @@ const loadData = useCallback(async () => {
         const expectedPct = totalWins > 0 && urPoolItems.length > 0 ? 100 / urPoolItems.length : 0;
         const actualPct = totalWins > 0 ? (wins / totalWins * 100) : 0;
         const luck = expectedPct > 0 ? actualPct / expectedPct : 1;
-        return { ...it, wins, totalWins, expectedPct, actualPct, luck };
+        const lastWinNum = itemLastWinNum[it.reward_item_id] || null;
+        const drawsSinceLastWin = lastWinNum != null ? Math.max(0, maxNum - lastWinNum) : null;
+        const lastWinIndex = Object.prototype.hasOwnProperty.call(itemLastWinIndex, it.reward_item_id) ? itemLastWinIndex[it.reward_item_id] : null;
+        const winsSinceLastWin = lastWinIndex != null ? Math.max(0, totalWins - 1 - lastWinIndex) : null;
+        return { ...it, wins, totalWins, expectedPct, actualPct, luck, lastWinNum, drawsSinceLastWin, winsSinceLastWin };
       }).sort((a,b) => b.wins - a.wins || ((Number(b.recovery_price) || 0) - (Number(a.recovery_price) || 0)));
 
       const neverWon = itemStats.filter(i => i.wins === 0);
@@ -1245,7 +1263,6 @@ const loadData = useCallback(async () => {
 
     // Item frequency chart data
     const itemChartData = e.itemStats
-      .filter(i => i.wins > 0)
       .map((it, idx) => ({
         name: cleanItemName(it.reward_item_name, 25),
         fullName: cleanItemName(it.reward_item_name, 100),
@@ -2081,20 +2098,26 @@ const loadData = useCallback(async () => {
               <div style={{background:`linear-gradient(135deg,${C.purple}08,${C.surface})`,border:`1px solid ${C.purple}25`,borderRadius:"10px",padding:"16px",marginBottom:"16px"}}>
                 <div style={{fontSize:"12px",fontWeight:600,color:C.purple,textTransform:"uppercase",letterSpacing:"1px",marginBottom:"4px"}}>Next item prediction</div>
                 <div style={{fontSize:"11px",color:C.dim,marginBottom:"12px"}}>
-                  If UR items are equally likely within the UR bucket ({(100/Math.max(e.urPoolItems.length, 1)).toFixed(1)}% each), items won less often are statistically "due" — though each draw is independent.
+                  If UR items are equally likely within the UR bucket ({(100/Math.max(e.urPoolItems.length, 1)).toFixed(1)}% each), this shows the lowest win-count tier first. When that tier has fewer than 3 items, the full next-lowest tier is added too.
                 </div>
-                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"10px"}}>
-                  {e.itemStats.slice(-3).reverse().map((it,i) => (
-                    <div key={i} style={{background:C.surfaceAlt,borderRadius:"8px",padding:"12px",border:`1px solid ${i===0?C.purple+"40":C.border}`}}>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:"10px"}}>
+                  {e.leastPickedUrItems.map((it,i) => {
+                    const minWins = e.leastUrWins;
+                    const isPrimaryTier = it.wins === minWins;
+                    return (
+                    <div key={it.reward_item_id || i} style={{background:C.surfaceAlt,borderRadius:"8px",padding:"12px",border:`1px solid ${isPrimaryTier?C.purple+"40":C.border}`}}>
                       {it.image_url && <img src={it.image_url} style={{width:"100%",height:"80px",objectFit:"contain",borderRadius:"6px",marginBottom:"8px",background:C.bg}} />}
-                      <div style={{fontSize:"11px",color:i===0?C.purple:C.text,fontWeight:600,lineHeight:1.3}}>{(it.reward_item_name||"").replace(/^[^｜]*｜/,"").slice(0,50)}</div>
+                      <div style={{fontSize:"11px",color:isPrimaryTier?C.purple:C.text,fontWeight:600,lineHeight:1.3}}>{(it.reward_item_name||"").replace(/^[^｜]*｜/,"").slice(0,50)}</div>
                       {it.recovery_price > 0 && <div style={{fontSize:"10px",color:C.gold,fontFamily:mono,marginTop:"2px"}}>₩{Math.round(it.recovery_price).toLocaleString()}</div>}
                       <div style={{fontSize:"10px",color:C.dim,marginTop:"4px"}}>{it.wins} wins ({it.actualPct.toFixed(1)}%)</div>
-                      <div style={{fontSize:"10px",color:it.luck<0.7?C.green:C.dim}}>
+                      <div style={{fontSize:"10px",color:C.dim,marginTop:"2px"}}>
+                        {it.wins === 0 ? "Never won yet" : `Not won for ${it.winsSinceLastWin.toLocaleString()} win${it.winsSinceLastWin !== 1 ? "s" : ""}` }
+                      </div>
+                      <div style={{fontSize:"10px",color:it.wins===0||it.luck<0.7?C.green:C.dim}}>
                         {it.wins===0?"Never won yet":it.luck<0.7?"Under-represented":it.luck>1.3?"Over-represented":"Normal"}
                       </div>
                     </div>
-                  ))}
+                  )})}
                 </div>
                 {e.neverWon.length > 0 && (
                   <div style={{marginTop:"12px",fontSize:"11px",color:C.green}}>
@@ -2127,6 +2150,9 @@ const loadData = useCallback(async () => {
                           {Number.isFinite(Number(it.recovery_price)) && <span style={{color:C.gold,fontFamily:mono}}>{formatCurrency(it.recovery_price)}</span>}
                           {Number.isFinite(Number(it.section_rate)) && <span>{formatPercent(it.section_rate, 2)} section</span>}
                           {rarity === "UR" && urStat && <span>{urStat.wins} win{urStat.wins !== 1 ? "s" : ""} · {urStat.actualPct.toFixed(1)}%</span>}
+                          {rarity === "UR" && urStat && (
+                            <span>{urStat.wins === 0 ? "Never won in our data" : `Not won for ${urStat.winsSinceLastWin.toLocaleString()} win${urStat.winsSinceLastWin !== 1 ? "s" : ""}` }</span>
+                          )}
                         </div>
                         {rarity === "UR" && urStat && (
                           <div style={{fontSize:"10px",marginTop:"4px",color:isNever?C.green:isHot?C.orange:isCold?C.cyan:C.muted}}>
