@@ -591,9 +591,10 @@ const loadData = useCallback(async () => {
   const [liveUpdatedPools, setLiveUpdatedPools] = useState([]);
 
   const liveFetch = useCallback(async () => {
+    setLiveStatus("");
+    setLiveUpdatedPools([]);
     setLiveLoading(true);
     setLiveStatus("Fetching event list...");
-    setLiveUpdatedPools([]);
     try {
       const API = KUJIMAN_API_BASE;
       const ts = () => Math.floor(Date.now() / 1000);
@@ -712,7 +713,6 @@ const loadData = useCallback(async () => {
 
       setLiveStatus(`✓ Live complete — ${activeEvts.length} events, ${totalNewRecs} new record${totalNewRecs !== 1 ? "s" : ""} saved`);
       setLiveUpdatedPools(updatedPoolNames);
-      setTimeout(() => setLiveStatus(""), 8000);
     } catch (e) {
       setLiveStatus(`Error: ${e.message}`);
     }
@@ -723,6 +723,7 @@ const loadData = useCallback(async () => {
   const [singleLiveStatus, setSingleLiveStatus] = useState("");
 
   const liveFetchSingle = useCallback(async (poolId, poolName) => {
+    setSingleLiveStatus("");
     setSingleLiveLoading(true);
     setSingleLiveStatus(`⚡ Fetching ${poolName}...`);
     try {
@@ -790,7 +791,6 @@ const loadData = useCallback(async () => {
       const maxInfo = mData?.max_num_sort ? ` · Max: #${mData.max_num_sort.toLocaleString()}` : "";
       setSingleLiveStatus(`✓ ${poolName} updated — ${newRecs} new record${newRecs !== 1 ? "s" : ""}${maxInfo}`);
       setLastRefresh(new Date());
-      setTimeout(() => setSingleLiveStatus(""), 6000);
     } catch (err) { setSingleLiveStatus(`Error: ${err.message}`); }
     setSingleLiveLoading(false);
   }, [snapshots, records]);
@@ -1312,8 +1312,15 @@ const loadData = useCallback(async () => {
           </div>
         </div>
         {singleLiveStatus && (
-          <div style={{margin:"0 28px",padding:"8px 12px",borderRadius:"0 0 6px 6px",background:`${C.cyan}10`,border:`1px solid ${C.cyan}25`,borderTop:"none",color:C.cyan,fontSize:"12px"}}>
-            {singleLiveStatus}
+          <div style={{margin:"0 28px",padding:"8px 12px",borderRadius:"0 0 6px 6px",background:`${C.cyan}10`,border:`1px solid ${C.cyan}25`,borderTop:"none",color:C.cyan,fontSize:"12px",display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:"12px"}}>
+            <div style={{flex:1}}>{singleLiveStatus}</div>
+            <button
+              onClick={() => setSingleLiveStatus("")}
+              style={{...baseBtn,background:"transparent",color:C.cyan,padding:"0",fontSize:"14px",lineHeight:1,flexShrink:0}}
+              title="Close"
+            >
+              ✕
+            </button>
           </div>
         )}
 
@@ -2205,13 +2212,25 @@ const loadData = useCallback(async () => {
       </div>
 
       {error && <div style={{margin:"16px 28px",padding:"12px",borderRadius:"8px",background:`${C.red}15`,border:`1px solid ${C.red}30`,color:C.red,fontSize:"13px"}}>Error: {error}</div>}
-      {liveStatus && <div style={{margin:"0 28px 8px",padding:"8px 12px",borderRadius:"6px",background:`${C.cyan}10`,border:`1px solid ${C.cyan}25`,color:C.cyan,fontSize:"12px"}}>
-        {liveStatus}
-        {liveUpdatedPools.length > 0 && (
-          <div style={{marginTop:"4px",fontSize:"11px",color:C.dim}}>
-            New records from: {liveUpdatedPools.map(p => <span key={p.pid} style={{color:C.gold,marginRight:"8px"}}>{p.name} (+{p.count})</span>)}
-          </div>
-        )}
+      {liveStatus && <div style={{margin:"0 28px 8px",padding:"8px 12px",borderRadius:"6px",background:`${C.cyan}10`,border:`1px solid ${C.cyan}25`,color:C.cyan,fontSize:"12px",display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:"12px"}}>
+        <div style={{flex:1}}>
+          <div>{liveStatus}</div>
+          {liveUpdatedPools.length > 0 && (
+            <div style={{marginTop:"4px",fontSize:"11px",color:C.dim}}>
+              New records from: {liveUpdatedPools.map(p => <span key={p.pid} style={{color:C.gold,marginRight:"8px"}}>{p.name} (+{p.count})</span>)}
+            </div>
+          )}
+        </div>
+        <button
+          onClick={() => {
+            setLiveStatus("");
+            setLiveUpdatedPools([]);
+          }}
+          style={{...baseBtn,background:"transparent",color:C.cyan,padding:"0",fontSize:"14px",lineHeight:1,flexShrink:0}}
+          title="Close"
+        >
+          ✕
+        </button>
       </div>}
 
       {/* Main View Tabs */}
