@@ -1273,6 +1273,60 @@ const loadData = useCallback(async () => {
         expectedPct: Number(it.expectedPct?.toFixed?.(2) ?? 0),
         fill: ITEM_COLORS[idx % ITEM_COLORS.length],
       }));
+    // Item recency ranking: sorted by wins-since-last-win ascending (most recent first), never-won at bottom
+    const itemRecencyData = [...e.itemStats]
+      .sort((a, b) => {
+        const aWon = a.wins > 0;
+        const bWon = b.wins > 0;
+        if (aWon && !bWon) return -1;
+        if (!aWon && bWon) return 1;
+        if (!aWon && !bWon) return String(a.reward_item_name || "").localeCompare(String(b.reward_item_name || ""));
+        return (a.winsSinceLastWin ?? Infinity) - (b.winsSinceLastWin ?? Infinity);
+      })
+      .map(it => ({
+        reward_item_id: it.reward_item_id,
+        name: cleanItemName(it.reward_item_name, 30),
+        fullName: cleanItemName(it.reward_item_name, 100),
+        image_url: it.image_url || null,
+        recovery_price: Number(it.recovery_price) || 0,
+        wins: it.wins,
+        winsSinceLastWin: it.winsSinceLastWin,
+        neverWon: it.wins === 0,
+      }));
+
+    // Combined prediction: frequency + recency composite score
+    const combinedPredictionItems = (() => {
+      if (!e.itemStats.length || !e.recs.length) return [];
+      const totalWins = e.recs.length;
+      const scored = e.itemStats.map(it => {
+        // Frequency score: 1 - luck. Higher = more underrepresented. Range roughly -N to 1.
+        const freqScore = clamp(1 - (it.luck || 1), -1, 1);
+        // Recency score: fraction of total wins since last appearance. Never-won = 1.0.
+        const recencyRaw = it.wins === 0
+          ? totalWins
+          : (it.winsSinceLastWin ?? totalWins);
+        const recencyScore = totalWins > 0 ? clamp(recencyRaw / totalWins, 0, 1) : 0;
+        // Combined: equal weight
+        const combined = 0.5 * freqScore + 0.5 * recencyScore;
+        return { ...it, freqScore, recencyScore, combined };
+      });
+      // Sort descending by combined score
+      scored.sort((a, b) => b.combined - a.combined);
+      // Pick top candidates: at least 3, extend if tie
+      const picked = [];
+      let tierScore = null;
+      for (const item of scored) {
+        if (tierScore === null) tierScore = item.combined;
+        if (picked.length < 3 || Math.abs(item.combined - tierScore) < 0.001) {
+          picked.push(item);
+          tierScore = item.combined;
+          continue;
+        }
+        break;
+      }
+      return picked;
+    })();
+
     const visiblePredictions = e.predictions.filter(p => p.method !== "Bayesian");
 
     const tabs = [
@@ -2053,75 +2107,192 @@ const loadData = useCallback(async () => {
 
           {/* ═══ ITEMS TAB ═══ */}
           {detailTab === "items" && (<>
-            {/* Item Win Frequency Chart */}
-            {itemChartData.length > 0 && (() => {
-              const maxWins = Math.max(...itemChartData.map(d => d.wins), 1);
-              return (
-                <div style={S.card}>
-                  <div style={{...S.sectionTitle}}>UR item win frequency</div>
-                  <div style={{display:"flex",flexDirection:"column",gap:"6px",marginTop:"8px"}}>
-                    {itemChartData.map((d, i) => (
-                      <div key={i} style={{display:"flex",alignItems:"center",gap:"10px",padding:"6px 8px",borderRadius:"8px",background:C.surfaceAlt,border:`1px solid ${C.border}`}}>
-                        {/* Item image */}
-                        {d.image_url ? (
-                          <img src={d.image_url} alt={d.fullName} style={{width:"40px",height:"40px",objectFit:"contain",borderRadius:"6px",background:C.bg,flexShrink:0}} />
-                        ) : (
-                          <div style={{width:"40px",height:"40px",borderRadius:"6px",background:C.bg,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"10px",color:C.muted}}>?</div>
-                        )}
+            {/* Item Win Frequency + Recency Ranking side by side */}
+            {(itemChartData.length > 0 || itemRecencyData.length > 0) && (
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(380px,1fr))",gap:"16px",marginBottom:"16px"}}>
+                {/* LEFT: UR item win frequency */}
+                {itemChartData.length > 0 && (() => {
+                  const maxWins = Math.max(...itemChartData.map(d => d.wins), 1);
+                  return (
+                    <div style={{...S.card,marginBottom:0}}>
+                      <div style={{...S.sectionTitle}}>UR item win frequency</div>
+                      <div style={{display:"flex",flexDirection:"column",gap:"6px",marginTop:"8px"}}>
+                        {itemChartData.map((d, i) => (
+                          <div key={i} style={{display:"flex",alignItems:"center",gap:"10px",padding:"6px 8px",borderRadius:"8px",background:C.surfaceAlt,border:`1px solid ${C.border}`}}>
+                            {/* Item image */}
+                            {d.image_url ? (
+                              <img src={d.image_url} alt={d.fullName} style={{width:"40px",height:"40px",objectFit:"contain",borderRadius:"6px",background:C.bg,flexShrink:0}} />
+                            ) : (
+                              <div style={{width:"40px",height:"40px",borderRadius:"6px",background:C.bg,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"10px",color:C.muted}}>?</div>
+                            )}
 
-                        {/* Name + price column */}
-                        <div style={{width:"160px",flexShrink:0,minWidth:0}}>
-                          <div style={{fontSize:"11px",fontWeight:600,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={d.fullName}>{d.name}</div>
-                          {d.recovery_price > 0 && (
-                            <div style={{fontSize:"10px",color:C.gold,fontFamily:mono,marginTop:"1px"}}>₩{Math.round(d.recovery_price).toLocaleString()}</div>
-                          )}
-                        </div>
+                            {/* Name + price column */}
+                            <div style={{width:"160px",flexShrink:0,minWidth:0}}>
+                              <div style={{fontSize:"11px",fontWeight:600,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={d.fullName}>{d.name}</div>
+                              {d.recovery_price > 0 && (
+                                <div style={{fontSize:"10px",color:C.gold,fontFamily:mono,marginTop:"1px"}}>₩{Math.round(d.recovery_price).toLocaleString()}</div>
+                              )}
+                            </div>
 
-                        {/* Bar + win count */}
-                        <div style={{flex:1,display:"flex",alignItems:"center",gap:"8px"}}>
-                          <div style={{flex:1,height:"14px",borderRadius:"4px",background:C.bg,overflow:"hidden"}}>
-                            <div style={{height:"100%",borderRadius:"4px",width:`${(d.wins / maxWins) * 100}%`,background:d.fill,transition:"width 0.3s ease"}} />
+                            {/* Bar + win count */}
+                            <div style={{flex:1,display:"flex",alignItems:"center",gap:"8px"}}>
+                              <div style={{flex:1,height:"14px",borderRadius:"4px",background:C.bg,overflow:"hidden"}}>
+                                <div style={{height:"100%",borderRadius:"4px",width:`${(d.wins / maxWins) * 100}%`,background:d.fill,transition:"width 0.3s ease"}} />
+                              </div>
+                              <div style={{fontSize:"11px",fontFamily:mono,fontWeight:600,color:d.fill,minWidth:"50px",textAlign:"right"}}>
+                                {d.wins} <span style={{fontSize:"9px",color:C.dim,fontWeight:400}}>({d.actualPct}%)</span>
+                              </div>
+                            </div>
                           </div>
-                          <div style={{fontSize:"11px",fontFamily:mono,fontWeight:600,color:d.fill,minWidth:"50px",textAlign:"right"}}>
-                            {d.wins} <span style={{fontSize:"9px",color:C.dim,fontWeight:400}}>({d.actualPct}%)</span>
-                          </div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              );
-            })()}
-
-            {/* Item Prediction */}
-            {e.poolItems.length > 0 && e.recs.length > 0 && (
-              <div style={{background:`linear-gradient(135deg,${C.purple}08,${C.surface})`,border:`1px solid ${C.purple}25`,borderRadius:"10px",padding:"16px",marginBottom:"16px"}}>
-                <div style={{fontSize:"12px",fontWeight:600,color:C.purple,textTransform:"uppercase",letterSpacing:"1px",marginBottom:"4px"}}>Next item prediction</div>
-                <div style={{fontSize:"11px",color:C.dim,marginBottom:"12px"}}>
-                  If UR items are equally likely within the UR bucket ({(100/Math.max(e.urPoolItems.length, 1)).toFixed(1)}% each), this shows the lowest win-count tier first. When that tier has fewer than 3 items, the full next-lowest tier is added too.
-                </div>
-                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:"10px"}}>
-                  {e.leastPickedUrItems.map((it,i) => {
-                    const minWins = e.leastUrWins;
-                    const isPrimaryTier = it.wins === minWins;
-                    return (
-                    <div key={it.reward_item_id || i} style={{background:C.surfaceAlt,borderRadius:"8px",padding:"12px",border:`1px solid ${isPrimaryTier?C.purple+"40":C.border}`}}>
-                      {it.image_url && <img src={it.image_url} style={{width:"100%",height:"80px",objectFit:"contain",borderRadius:"6px",marginBottom:"8px",background:C.bg}} />}
-                      <div style={{fontSize:"11px",color:isPrimaryTier?C.purple:C.text,fontWeight:600,lineHeight:1.3}}>{(it.reward_item_name||"").replace(/^[^｜]*｜/,"").slice(0,50)}</div>
-                      {it.recovery_price > 0 && <div style={{fontSize:"10px",color:C.gold,fontFamily:mono,marginTop:"2px"}}>₩{Math.round(it.recovery_price).toLocaleString()}</div>}
-                      <div style={{fontSize:"10px",color:C.dim,marginTop:"4px"}}>{it.wins} wins ({it.actualPct.toFixed(1)}%)</div>
-                      <div style={{fontSize:"10px",color:C.dim,marginTop:"2px"}}>
-                        {it.wins === 0 ? "Never won yet" : `Not won for ${it.winsSinceLastWin.toLocaleString()} win${it.winsSinceLastWin !== 1 ? "s" : ""}` }
-                      </div>
-                      <div style={{fontSize:"10px",color:it.wins===0||it.luck<0.7?C.green:C.dim}}>
-                        {it.wins===0?"Never won yet":it.luck<0.7?"Under-represented":it.luck>1.3?"Over-represented":"Normal"}
+                        ))}
                       </div>
                     </div>
-                  )})}
+                  );
+                })()}
+
+                {/* RIGHT: UR item recency ranking */}
+                {itemRecencyData.length > 0 && (
+                  <div style={{...S.card,marginBottom:0}}>
+                    <div style={{...S.sectionTitle}}>UR item recency ranking</div>
+                    <div style={{fontSize:"10px",color:C.dim,marginBottom:"10px"}}>
+                      Ordered by how recently each UR item was won. Top = most recent. Bottom = longest since last win.
+                    </div>
+                    <div style={{display:"flex",flexDirection:"column",gap:"6px"}}>
+                      {itemRecencyData.map((d, i) => {
+                        const isNever = d.neverWon;
+                        const gapLabel = isNever
+                          ? "Never won in our data"
+                          : d.winsSinceLastWin === 0
+                            ? "Won on last UR win"
+                            : `Not won for ${d.winsSinceLastWin.toLocaleString()} win${d.winsSinceLastWin !== 1 ? "s" : ""}`;
+                        const gapColor = isNever ? C.purple : d.winsSinceLastWin === 0 ? C.green : d.winsSinceLastWin >= 5 ? C.red : d.winsSinceLastWin >= 3 ? C.orange : C.dim;
+                        return (
+                          <div key={d.reward_item_id || i} style={{display:"flex",alignItems:"center",gap:"10px",padding:"6px 8px",borderRadius:"8px",background:isNever?`${C.purple}08`:C.surfaceAlt,border:`1px solid ${isNever?C.purple+"30":C.border}`}}>
+                            {/* Rank */}
+                            <div style={{fontSize:"11px",fontFamily:mono,fontWeight:600,color:C.muted,width:"22px",textAlign:"center",flexShrink:0}}>
+                              {i + 1}
+                            </div>
+                            {/* Item image */}
+                            {d.image_url ? (
+                              <img src={d.image_url} alt={d.fullName} style={{width:"36px",height:"36px",objectFit:"contain",borderRadius:"6px",background:C.bg,flexShrink:0}} />
+                            ) : (
+                              <div style={{width:"36px",height:"36px",borderRadius:"6px",background:C.bg,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"10px",color:C.muted}}>?</div>
+                            )}
+                            {/* Name + price */}
+                            <div style={{flex:1,minWidth:0}}>
+                              <div style={{fontSize:"11px",fontWeight:600,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={d.fullName}>{d.name}</div>
+                              <div style={{display:"flex",alignItems:"center",gap:"8px",marginTop:"2px"}}>
+                                {d.recovery_price > 0 && (
+                                  <span style={{fontSize:"10px",color:C.gold,fontFamily:mono}}>₩{Math.round(d.recovery_price).toLocaleString()}</span>
+                                )}
+                                <span style={{fontSize:"10px",color:gapColor,fontWeight:isNever?600:500}}>{gapLabel}</span>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Item Prediction — Frequency + Combined */}
+            {e.poolItems.length > 0 && e.recs.length > 0 && (
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(380px,1fr))",gap:"16px",marginBottom:"16px"}}>
+
+                {/* LEFT: Frequency-based prediction (original logic) */}
+                <div style={{background:`linear-gradient(135deg,${C.purple}08,${C.surface})`,border:`1px solid ${C.purple}25`,borderRadius:"10px",padding:"16px"}}>
+                  <div style={{fontSize:"12px",fontWeight:600,color:C.purple,textTransform:"uppercase",letterSpacing:"1px",marginBottom:"4px"}}>
+                    Frequency-based candidates
+                  </div>
+                  <div style={{fontSize:"10px",color:C.dim,marginBottom:"12px"}}>
+                    Ranked by win count only. Shows the lowest win-count tier first. If fewer than 3, the next tier is added.
+                    Fair share: {(100/Math.max(e.urPoolItems.length, 1)).toFixed(1)}% each.
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))",gap:"10px"}}>
+                    {e.leastPickedUrItems.map((it,i) => {
+                      const minWins = e.leastUrWins;
+                      const isPrimaryTier = it.wins === minWins;
+                      return (
+                      <div key={it.reward_item_id || i} style={{background:C.surfaceAlt,borderRadius:"8px",padding:"12px",border:`1px solid ${isPrimaryTier?C.purple+"40":C.border}`}}>
+                        {it.image_url ? (
+                          <img src={it.image_url} style={{width:"100%",height:"70px",objectFit:"contain",borderRadius:"6px",marginBottom:"8px",background:C.bg}} />
+                        ) : (
+                          <div style={{width:"100%",height:"70px",borderRadius:"6px",marginBottom:"8px",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"10px",color:C.muted}}>?</div>
+                        )}
+                        <div style={{fontSize:"11px",color:isPrimaryTier?C.purple:C.text,fontWeight:600,lineHeight:1.3}}>{cleanItemName(it.reward_item_name, 40)}</div>
+                        {it.recovery_price > 0 && <div style={{fontSize:"10px",color:C.gold,fontFamily:mono,marginTop:"2px"}}>₩{Math.round(it.recovery_price).toLocaleString()}</div>}
+                        <div style={{fontSize:"10px",color:C.dim,marginTop:"4px"}}>{it.wins} wins ({it.actualPct.toFixed(1)}%)</div>
+                        <div style={{fontSize:"10px",color:C.dim,marginTop:"2px"}}>
+                          {it.wins === 0 ? "Never won yet" : `Not won for ${it.winsSinceLastWin.toLocaleString()} win${it.winsSinceLastWin !== 1 ? "s" : ""}` }
+                        </div>
+                        <div style={{fontSize:"10px",color:it.wins===0||it.luck<0.7?C.green:C.dim}}>
+                          {it.wins===0?"Never won yet":it.luck<0.7?"Under-represented":it.luck>1.3?"Over-represented":"Normal"}
+                        </div>
+                      </div>
+                    )})}
+                  </div>
+                  {e.neverWon.length > 0 && (
+                    <div style={{marginTop:"12px",fontSize:"11px",color:C.green}}>
+                      {e.neverWon.length} UR item(s) never won in our data — possible cold candidates
+                    </div>
+                  )}
                 </div>
-                {e.neverWon.length > 0 && (
-                  <div style={{marginTop:"12px",fontSize:"11px",color:C.green}}>
-                    {e.neverWon.length} UR item(s) never won in our data — possible cold candidates
+
+                {/* RIGHT: Combined frequency + recency prediction */}
+                {combinedPredictionItems.length > 0 && (
+                  <div style={{background:`linear-gradient(135deg,${C.cyan}08,${C.surface})`,border:`1px solid ${C.cyan}25`,borderRadius:"10px",padding:"16px"}}>
+                    <div style={{fontSize:"12px",fontWeight:600,color:C.cyan,textTransform:"uppercase",letterSpacing:"1px",marginBottom:"4px"}}>
+                      Combined candidates
+                    </div>
+                    <div style={{fontSize:"10px",color:C.dim,marginBottom:"12px"}}>
+                      Combines two signals: frequency deficit (how under-picked) and recency gap (how long since last win). Items that are both underrepresented and forgotten rank highest.
+                    </div>
+                    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))",gap:"10px"}}>
+                      {combinedPredictionItems.map((it,i) => {
+                        const isTop = i === 0;
+                        const scoreColor = it.combined >= 0.5 ? C.cyan : it.combined >= 0.25 ? C.blue : C.dim;
+                        return (
+                        <div key={it.reward_item_id || i} style={{background:C.surfaceAlt,borderRadius:"8px",padding:"12px",border:`1px solid ${isTop?C.cyan+"40":C.border}`}}>
+                          {it.image_url ? (
+                            <img src={it.image_url} style={{width:"100%",height:"70px",objectFit:"contain",borderRadius:"6px",marginBottom:"8px",background:C.bg}} />
+                          ) : (
+                            <div style={{width:"100%",height:"70px",borderRadius:"6px",marginBottom:"8px",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"10px",color:C.muted}}>?</div>
+                          )}
+                          <div style={{fontSize:"11px",color:isTop?C.cyan:C.text,fontWeight:600,lineHeight:1.3}}>{cleanItemName(it.reward_item_name, 40)}</div>
+                          {it.recovery_price > 0 && <div style={{fontSize:"10px",color:C.gold,fontFamily:mono,marginTop:"2px"}}>₩{Math.round(it.recovery_price).toLocaleString()}</div>}
+                          <div style={{fontSize:"10px",color:C.dim,marginTop:"4px"}}>{it.wins} wins ({it.actualPct.toFixed(1)}%)</div>
+                          <div style={{fontSize:"10px",color:C.dim,marginTop:"2px"}}>
+                            {it.wins === 0 ? "Never won yet" : `Not won for ${it.winsSinceLastWin.toLocaleString()} win${it.winsSinceLastWin !== 1 ? "s" : ""}` }
+                          </div>
+                          {/* Score breakdown */}
+                          <div style={{marginTop:"6px",padding:"5px 7px",borderRadius:"5px",background:C.bg,border:`1px solid ${C.border}`}}>
+                            <div style={{display:"flex",justifyContent:"space-between",fontSize:"9px",color:C.muted,marginBottom:"3px"}}>
+                              <span>Freq deficit</span>
+                              <span style={{fontFamily:mono,color:it.freqScore>0.3?C.purple:C.dim}}>{(it.freqScore*100).toFixed(0)}%</span>
+                            </div>
+                            <div style={{height:"3px",borderRadius:"2px",background:C.surfaceAlt,overflow:"hidden",marginBottom:"4px"}}>
+                              <div style={{height:"100%",borderRadius:"2px",width:`${clamp(it.freqScore*100,0,100)}%`,background:C.purple,transition:"width 0.3s ease"}} />
+                            </div>
+                            <div style={{display:"flex",justifyContent:"space-between",fontSize:"9px",color:C.muted,marginBottom:"3px"}}>
+                              <span>Recency gap</span>
+                              <span style={{fontFamily:mono,color:it.recencyScore>0.3?C.orange:C.dim}}>{(it.recencyScore*100).toFixed(0)}%</span>
+                            </div>
+                            <div style={{height:"3px",borderRadius:"2px",background:C.surfaceAlt,overflow:"hidden",marginBottom:"4px"}}>
+                              <div style={{height:"100%",borderRadius:"2px",width:`${clamp(it.recencyScore*100,0,100)}%`,background:C.orange,transition:"width 0.3s ease"}} />
+                            </div>
+                            <div style={{display:"flex",justifyContent:"space-between",fontSize:"9px",marginTop:"2px"}}>
+                              <span style={{color:C.muted,fontWeight:600}}>Combined</span>
+                              <span style={{fontFamily:mono,fontWeight:700,color:scoreColor}}>{(it.combined*100).toFixed(0)}%</span>
+                            </div>
+                          </div>
+                        </div>
+                      )})}
+                    </div>
+                    <div style={{marginTop:"10px",fontSize:"10px",color:C.muted,fontStyle:"italic"}}>
+                      Combined score = 50% frequency deficit + 50% recency gap. Higher = stronger candidate. This is a pattern observation, not a guarantee.
+                    </div>
                   </div>
                 )}
               </div>
